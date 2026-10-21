@@ -99,13 +99,33 @@ Notes:
 - Only quantized (`PTQ1_0`) folded weights are supported; the `F16` and
   `PQ2_0` Bonsai files are rejected with an explicit error rather than loaded
   without their transform.
-- Matmuls are dispatched by batch size: the dp4a MMVQ kernel up to 6 rows,
-  a Triton GEMM that decodes the trits on the fly up to 128 rows, and
-  dequantize + cuBLAS beyond that.
+- Matmuls are dispatched by batch size, with thresholds measured on an L4
+  with weights streaming from HBM: a CUDA mat-vec that decodes each weight
+  block once for up to 8 rows (planar Q8 activation layout, dp4a), a Triton
+  GEMM with pre-quantized int8 activations and int8 tensor-core dots from
+  9 to 256 rows, and dequantize + cuBLAS beyond that. Every tier quantizes
+  activations identically (Q8 per 32 elements, fp16 scale), and the tests
+  cross-check the tiers against each other to 1e-4 relative in fp32.
 - Validated against the PrismML llama.cpp build on an NVIDIA L4: greedy
-  continuations of the 2B and 27B PTQ1_0 files match token for token on
-  raw prompts (first-token logprobs agree to about 0.05 nat), and the 27B
-  decodes a single sequence at ~26 tok/s (llama.cpp: ~34 tok/s).
+  continuations of the 27B PTQ1_0 file match token for token on raw
+  prompts (first-token logprobs agree to about 0.07 nat; the 2B matches
+  on 3 of 4 prompts with a late near-tie divergence on the fourth).
+- Serving throughput on one L4 for the 27B, ~175-token prompts, 1024
+  forced output tokens per user, one request per user (tok/s aggregate,
+  `benchmarks/prism/bench_vllm_users.py` vs `bench_llamacpp_users.py`):
+
+  | Users | vLLM + plugin | llama.cpp (PrismML fork) |
+  |-------|---------------|--------------------------|
+  | 1     | 29            | 35                       |
+  | 8     | 105           | 111                      |
+  | 16    | 148           | 140                      |
+  | 32    | 192           | 160                      |
+  | 48    | 153           | 170                      |
+
+  Remaining gaps: at batch 1-8 the mat-vec is at ~80% of HBM bandwidth and
+  the rest of the step is vLLM overhead; at 48 users the step is dominated
+  by vLLM's fp32 gated-delta-net state traffic and scheduler overhead
+  rather than the PTQ1_0 kernels.
 
 ## Tested model coverage
 
