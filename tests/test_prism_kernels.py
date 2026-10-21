@@ -93,11 +93,11 @@ def test_ptq1_0_gemm_triton(num_tokens: int, hidden_size: int, dtype: torch.dtyp
     torch.testing.assert_close(out, ref, atol=0.2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 64])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [1, 6, 7, 64, 128, 129, 300])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
 @torch.inference_mode()
 def test_ptq1_0_fused_mul_mat_dispatch(num_tokens: int, dtype: torch.dtype):
-    """The linear method must route PTQ1_0 through MMVQ or dequant + GEMM."""
+    """Every PTQ1_0 dispatch tier (MMVQ, Triton GEMM, dequant + GEMM) agrees."""
     seed_everything(0)
     packed, dense = _packed(_ternary_weight(NUM_ROWS, 1024))
     x = torch.rand((num_tokens, 1024), dtype=dtype, device="cuda")

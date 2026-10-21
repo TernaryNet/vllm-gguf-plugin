@@ -28,8 +28,17 @@ from .utils import (
     IMATRIX_QUANT_TYPES,
     MMQ_QUANT_TYPES,
     MMVQ_QUANT_TYPES,
+    PRISM_TERNARY_TYPES,
     UNQUANTIZED_TYPES,
 )
+
+# PTQ1_0 has no MMQ kernel. Measured on an L4 for the Bonsai-27B shapes, the
+# MMVQ kernel is bandwidth-bound at batch 1 but re-reads the weights per row,
+# the Triton GEMM decodes each weight once and is flat in the batch size, and
+# dequantize + cuBLAS only wins once the batch is large enough to amortize
+# writing the bf16 copy of the weights.
+_PRISM_MMVQ_MAX_ROWS = 6
+_PRISM_TRITON_GEMM_MAX_ROWS = 128
 
 
 def _fused_mul_mat_gguf(
@@ -42,6 +51,15 @@ def _fused_mul_mat_gguf(
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type in UNQUANTIZED_TYPES:
+        return x @ weight.T
+    if weight_type in PRISM_TERNARY_TYPES:
+        if x.shape[0] <= _PRISM_MMVQ_MAX_ROWS:
+            return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
+        if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
+            return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
+        block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+        shape = (weight.shape[0], weight.shape[1] // type_size * block_size)
+        weight = ops.ggml_dequantize(weight, weight_type, *shape, x.dtype)
         return x @ weight.T
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
