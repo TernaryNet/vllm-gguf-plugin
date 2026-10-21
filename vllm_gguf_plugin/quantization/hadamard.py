@@ -279,6 +279,11 @@ class GGUFHadamardLayout:
     already in vLLM order, so ``weight_to_vllm`` is the identity; sharding a
     row-parallel weight is only allowed at Hadamard block boundaries because
     the transform mixes the elements of a block.
+
+    ``prepare`` moves the rotation matrix and sign vector to the weight's
+    device once the weights are loaded. The forward transform must not create
+    or copy tensors itself: it is traced by torch.compile and captured into
+    CUDA graphs, where a host-to-device copy is an error.
     """
 
     def __init__(
@@ -302,50 +307,72 @@ class GGUFHadamardLayout:
         self.width = width
         self.forward = forward
         self.inverse = inverse
-        self._signs = (
-            None if signs is None else torch.from_numpy(np.ascontiguousarray(signs))
+        self._signs_cpu = (
+            None
+            if signs is None
+            else torch.from_numpy(np.ascontiguousarray(signs)).to(
+                HADAMARD_COMPUTE_DTYPE
+            )
         )
-        self._signs_cache: dict[
-            tuple[torch.device, torch.dtype, int, int], torch.Tensor
-        ] = {}
+        self._device: torch.device | None = None
+        self._matrix: torch.Tensor | None = None
+        self._signs: torch.Tensor | None = None
+        self._tp_rank = 0
 
     def __repr__(self) -> str:
         return (
             f"GGUFHadamardLayout(block_size={self.block_size}, width={self.width}, "
-            f"signs={'explicit' if self._signs is not None else 'identity'}, "
+            f"signs={'explicit' if self._signs_cpu is not None else 'identity'}, "
             f"forward={self.forward}, inverse={self.inverse})"
         )
+
+    def prepare(self, device: torch.device | str) -> None:
+        """Materialize the transform's constants on *device*."""
+        device = torch.device(device)
+        if self._device == device:
+            return
+        self._matrix = hadamard_matrix(self.block_size, device, HADAMARD_COMPUTE_DTYPE)
+        self._signs = (
+            None if self._signs_cpu is None else self._signs_cpu.to(device=device)
+        )
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            self._tp_rank = get_tensor_model_parallel_rank()
+        except (ImportError, AssertionError):
+            # not running inside an initialized vLLM worker (unit tests)
+            self._tp_rank = 0
+        self._device = device
 
     def _local_signs(self, x: torch.Tensor) -> torch.Tensor | None:
         if self._signs is None:
             return None
         local_width = x.shape[-1]
         if local_width == self.width:
-            tp_rank, tp_size = 0, 1
-        else:
-            tp_size, remainder = divmod(self.width, local_width)
-            if remainder or local_width % self.block_size:
-                raise ValueError(
-                    f"Activation width {local_width} is not a Hadamard-block-aligned "
-                    f"shard of the folded width {self.width} (block {self.block_size})"
-                )
-            from vllm.distributed import get_tensor_model_parallel_rank
-
-            tp_rank = get_tensor_model_parallel_rank()
-        key = (x.device, HADAMARD_COMPUTE_DTYPE, tp_rank, tp_size)
-        signs = self._signs_cache.get(key)
-        if signs is None:
-            signs = self._signs[tp_rank * local_width : (tp_rank + 1) * local_width]
-            signs = signs.to(device=x.device, dtype=HADAMARD_COMPUTE_DTYPE)
-            self._signs_cache[key] = signs
-        return signs
+            return self._signs
+        tp_size, remainder = divmod(self.width, local_width)
+        if remainder or local_width % self.block_size:
+            raise ValueError(
+                f"Activation width {local_width} is not a Hadamard-block-aligned "
+                f"shard of the folded width {self.width} (block {self.block_size})"
+            )
+        if self._tp_rank >= tp_size:
+            raise ValueError(
+                f"Tensor parallel rank {self._tp_rank} is out of range for the "
+                f"{tp_size}-way shard of a Hadamard-folded input"
+            )
+        start = self._tp_rank * local_width
+        return self._signs[start : start + local_width]
 
     def _apply(self, x: torch.Tensor, *, inverse: bool) -> torch.Tensor:
+        if self._device != x.device:
+            self.prepare(x.device)
+        assert self._matrix is not None
         signs = self._local_signs(x)
         out = x.to(HADAMARD_COMPUTE_DTYPE)
         if not inverse and signs is not None:
             out = out * signs
-        out = fwht(out, self.block_size)
+        out = (out.reshape(-1, self.block_size) @ self._matrix).reshape(x.shape)
         if inverse and signs is not None:
             out = out * signs
         return out.to(x.dtype)

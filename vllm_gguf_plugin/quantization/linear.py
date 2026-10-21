@@ -160,6 +160,10 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {weight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        if self.layout is not None:
+            # Constants used by the input transform must live on the weight's
+            # device before the first (traced / CUDA-graph captured) forward.
+            self.layout.prepare(layer.weight.device)
 
     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
         self._materialize_weight(layer)

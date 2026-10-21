@@ -14,6 +14,8 @@ class GGUFLinearLayout(Protocol):
 
     def output_to_vllm(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    def prepare(self, device: torch.device | str) -> None: ...
+
     def weight_to_vllm(
         self,
         weight: torch.Tensor,
@@ -61,6 +63,9 @@ class GGUFHeadTilingLayout:
 
     def output_to_vllm(self, x: torch.Tensor) -> torch.Tensor:
         return x
+
+    def prepare(self, device: torch.device | str) -> None:
+        del device
 
     def weight_to_vllm(
         self,
