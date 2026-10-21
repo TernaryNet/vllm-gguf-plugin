@@ -148,6 +148,12 @@ class GGUFConfig(QuantizationConfig):
                 self.unquantized_modules
             )
         if self.linear_layouts:
-            layouts = self.linear_layouts
-            mapped_names = hf_to_vllm_mapper.apply_list(list(layouts))
-            self.linear_layouts = dict(zip(mapped_names, layouts.values(), strict=True))
+            # Layouts are keyed by module name while the mapper's prefixes end
+            # with a dot ("lm_head." -> "language_model.lm_head."), so map the
+            # module's weight name and strip the suffix again.
+            layouts: dict[str, GGUFLinearLayout] = {}
+            for name, layout in self.linear_layouts.items():
+                mapped = hf_to_vllm_mapper.apply_list([f"{name}.weight"])
+                if mapped:
+                    layouts[mapped[0].removesuffix(".weight")] = layout
+            self.linear_layouts = layouts
