@@ -99,8 +99,13 @@ Notes:
 - Only quantized (`PTQ1_0`) folded weights are supported; the `F16` and
   `PQ2_0` Bonsai files are rejected with an explicit error rather than loaded
   without their transform.
-- Large batches fall back to dequantize + GEMM; the MMVQ path serves small
-  decode batches.
+- Matmuls are dispatched by batch size: the dp4a MMVQ kernel up to 6 rows,
+  a Triton GEMM that decodes the trits on the fly up to 128 rows, and
+  dequantize + cuBLAS beyond that.
+- Validated against the PrismML llama.cpp build on an NVIDIA L4: greedy
+  continuations of the 2B and 27B PTQ1_0 files match token for token on
+  raw prompts (first-token logprobs agree to about 0.05 nat), and the 27B
+  decodes a single sequence at ~26 tok/s (llama.cpp: ~34 tok/s).
 
 ## Tested model coverage
 
