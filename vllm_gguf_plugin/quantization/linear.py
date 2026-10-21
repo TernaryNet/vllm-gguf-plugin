@@ -32,13 +32,18 @@ from .utils import (
     UNQUANTIZED_TYPES,
 )
 
-# PTQ1_0 has no MMQ kernel. Measured on an L4 for the Bonsai-27B shapes, the
-# MMVQ kernel is bandwidth-bound at batch 1 but re-reads the weights per row,
-# the Triton GEMM decodes each weight once and is flat in the batch size, and
-# dequantize + cuBLAS only wins once the batch is large enough to amortize
-# writing the bf16 copy of the weights.
+# PTQ1_0 has no MMQ kernel. Measured on an L4 for the Bonsai-27B shapes with
+# weights streaming from HBM: the planar multi-column mat-vec decodes each
+# weight block once for up to 16 rows (0.16 ms at batch 1 for the 5120->34816
+# layer, 0.67 ms at batch 16), the Triton GEMM is cheaper from 17 rows up to
+# about 128, and dequantize + cuBLAS only wins beyond that. The generic MMVQ
+# kernel re-reads the weights per row and is only the fallback without the
+# dedicated kernel.
 _PRISM_MMVQ_MAX_ROWS = 6
 _PRISM_TRITON_GEMM_MAX_ROWS = 128
+# Dequantize wide weights (the 248k-row Bonsai head) in row chunks so the bf16
+# copy stays well under the whole-matrix footprint.
+_PRISM_DEQUANT_ROW_CHUNK = 16384
 
 
 def _fused_mul_mat_gguf(
@@ -53,14 +58,27 @@ def _fused_mul_mat_gguf(
     if weight_type in UNQUANTIZED_TYPES:
         return x @ weight.T
     if weight_type in PRISM_TERNARY_TYPES:
+        if x.shape[0] <= ops.PTQ1_0_MMV_MAX_ROWS and ops.ptq1_0_mmv_available():
+            return ops.ggml_mul_mat_vec_ptq1_0(weight, x, weight.shape[0])
         if x.shape[0] <= _PRISM_MMVQ_MAX_ROWS:
             return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
         if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
             return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
         block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
-        shape = (weight.shape[0], weight.shape[1] // type_size * block_size)
-        weight = ops.ggml_dequantize(weight, weight_type, *shape, x.dtype)
-        return x @ weight.T
+        hidden = weight.shape[1] // type_size * block_size
+        if weight.shape[0] <= _PRISM_DEQUANT_ROW_CHUNK:
+            dense = ops.ggml_dequantize(
+                weight, weight_type, weight.shape[0], hidden, x.dtype
+            )
+            return x @ dense.T
+        outputs = []
+        for start in range(0, weight.shape[0], _PRISM_DEQUANT_ROW_CHUNK):
+            chunk = weight[start : start + _PRISM_DEQUANT_ROW_CHUNK]
+            dense = ops.ggml_dequantize(
+                chunk, weight_type, chunk.shape[0], hidden, x.dtype
+            )
+            outputs.append(x @ dense.T)
+        return torch.cat(outputs, dim=1)
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
     elif weight_type in MMQ_QUANT_TYPES:

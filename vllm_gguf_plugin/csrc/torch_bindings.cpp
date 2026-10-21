@@ -12,6 +12,7 @@ Tensor ggml_dequantize(Tensor W, int64_t type, int64_t m, int64_t n,
                        std::optional<ScalarType> dtype);
 Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_mul_mat_a8(Tensor W, Tensor X, int64_t type, int64_t row);
+Tensor ggml_mul_mat_vec_ptq1_0(Tensor W, Tensor X, int64_t row);
 Tensor ggml_moe_a8(Tensor X, Tensor W, Tensor sorted_token_ids,
                    Tensor expert_ids, Tensor num_tokens_post_padded,
                    int64_t type, int64_t row, int64_t top_k, int64_t tokens);
@@ -28,6 +29,7 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
       "-> Tensor");
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
+  ops.def("ggml_mul_mat_vec_ptq1_0(Tensor W, Tensor X, SymInt row) -> Tensor");
   ops.def(
       "ggml_moe_a8(Tensor X, Tensor W, "
       "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
@@ -44,6 +46,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_dequantize", TORCH_BOX(&ggml_dequantize));
   ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
+  ops.impl("ggml_mul_mat_vec_ptq1_0", TORCH_BOX(&ggml_mul_mat_vec_ptq1_0));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
 }

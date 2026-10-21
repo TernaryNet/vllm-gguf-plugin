@@ -298,13 +298,15 @@ def run_triton_kernel(
     row: int,
     quant_type: int,
     extra_args: tuple = (),
+    block_m: int = TRITON_BLOCK_M,
+    block_n: int = TRITON_BLOCK_N,
 ) -> torch.Tensor:
     W, X_2d, X_shape, num_k_blocks = _validate_args(W, X, row, quant_type)
     Y_2d = torch.empty((X_2d.shape[0], row), device=X.device, dtype=X.dtype)
 
     grid = (
-        triton.cdiv(X_2d.shape[0], TRITON_BLOCK_M),
-        triton.cdiv(row, TRITON_BLOCK_N),
+        triton.cdiv(X_2d.shape[0], block_m),
+        triton.cdiv(row, block_n),
     )
 
     kernel[grid](
@@ -320,8 +322,8 @@ def run_triton_kernel(
         Y_2d.stride(0),
         Y_2d.stride(1),
         *extra_args,
-        BLOCK_M=TRITON_BLOCK_M,
-        BLOCK_N=TRITON_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         BLOCK_K_BLOCKS=TRITON_BLOCK_K_BLOCKS,
         num_warps=TRITON_NUM_WARPS,
         num_stages=TRITON_NUM_STAGES,

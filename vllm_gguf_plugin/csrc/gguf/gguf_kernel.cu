@@ -13,6 +13,7 @@
 #include "vecdotq.cuh"
 #include "dequantize.cuh"
 #include "mmvq.cuh"
+#include "ptq1_0_pt.cuh"
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
@@ -218,6 +219,34 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
             (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
     }
+  });
+  return Y;
+}
+
+// PTQ1_0 mat-vec for up to PTQ1_0_PT_MAX_COLS activation rows: weights are
+// decoded once per block and reused across the rows (see ptq1_0_pt.cuh).
+Tensor ggml_mul_mat_vec_ptq1_0(Tensor W,  // quant weight
+                               Tensor X,  // input
+                               int64_t row) {
+  const int64_t col = X.sizes()[1];
+  const int64_t vecs = X.sizes()[0];
+  const int32_t device_idx = X.get_device_index();
+  const DeviceGuard device_guard(device_idx);
+  cudaStream_t stream = get_current_cuda_stream(device_idx);
+  const int nblk = ptq1_0_pt_nblk(col);
+  const int64_t ncols_q = ptq1_0_pt_ncols(vecs);
+  // 9 planes of nblk 16-byte pieces per column; the kernel never reads the
+  // columns beyond vecs, so nothing needs zeroing.
+  Tensor quant_X = torch::stable::new_empty(
+      W, {ncols_q, (int64_t)PTQ1_0_PT_PLANES * nblk * 4}, ScalarType::Int);
+  Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_vec_ptq1_0", [&] {
+    quantize_q8_1_pt_cuda<scalar_t>((scalar_t*)X.data_ptr(),
+                                    (void*)quant_X.data_ptr(), col, vecs, nblk,
+                                    stream);
+    mul_mat_vec_ptq1_0_pt_cuda<scalar_t>(
+        (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+        col, row, vecs, stream);
   });
   return Y;
 }

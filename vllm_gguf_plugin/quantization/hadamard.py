@@ -41,9 +41,13 @@ HADAMARD_AXIS = "input-last-dimension"
 _FLOAT_TYPES = frozenset(
     {GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16}
 )
-#: The rotation is computed in this dtype. llama.cpp keeps its activations in
-#: fp32, so the transform runs in fp32 and is cast back to the model dtype.
+#: Reference compute dtype of ``fwht``. The layout transform itself runs in the
+#: activation dtype when that is bf16/fp16: the inputs are exact in that dtype,
+#: the ±1/sqrt(n) matrix entries are exact, cuBLAS accumulates in fp32, and the
+#: result is rounded to the activation dtype either way, so the tensor-core
+#: path gives the same values as an fp32 transform up to summation order.
 HADAMARD_COMPUTE_DTYPE = torch.float32
+_LAYOUT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 @dataclass(frozen=True, eq=False)
@@ -315,8 +319,8 @@ class GGUFHadamardLayout:
             )
         )
         self._device: torch.device | None = None
-        self._matrix: torch.Tensor | None = None
-        self._signs: torch.Tensor | None = None
+        self._matrices: dict[torch.dtype, torch.Tensor] = {}
+        self._signs: dict[torch.dtype, torch.Tensor] = {}
         self._tp_rank = 0
 
     def __repr__(self) -> str:
@@ -327,14 +331,20 @@ class GGUFHadamardLayout:
         )
 
     def prepare(self, device: torch.device | str) -> None:
-        """Materialize the transform's constants on *device*."""
+        """Materialize the transform's constants on *device* for every dtype."""
         device = torch.device(device)
         if self._device == device:
             return
-        self._matrix = hadamard_matrix(self.block_size, device, HADAMARD_COMPUTE_DTYPE)
-        self._signs = (
-            None if self._signs_cpu is None else self._signs_cpu.to(device=device)
-        )
+        self._matrices = {
+            dtype: hadamard_matrix(self.block_size, device, dtype)
+            for dtype in _LAYOUT_DTYPES
+        }
+        self._signs = {}
+        if self._signs_cpu is not None:
+            self._signs = {
+                dtype: self._signs_cpu.to(device=device, dtype=dtype)
+                for dtype in _LAYOUT_DTYPES
+            }
         try:
             from vllm.distributed import get_tensor_model_parallel_rank
 
@@ -344,12 +354,13 @@ class GGUFHadamardLayout:
             self._tp_rank = 0
         self._device = device
 
-    def _local_signs(self, x: torch.Tensor) -> torch.Tensor | None:
-        if self._signs is None:
+    def _local_signs(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
+        if not self._signs:
             return None
+        signs = self._signs[dtype]
         local_width = x.shape[-1]
         if local_width == self.width:
-            return self._signs
+            return signs
         tp_size, remainder = divmod(self.width, local_width)
         if remainder or local_width % self.block_size:
             raise ValueError(
@@ -362,17 +373,18 @@ class GGUFHadamardLayout:
                 f"{tp_size}-way shard of a Hadamard-folded input"
             )
         start = self._tp_rank * local_width
-        return self._signs[start : start + local_width]
+        return signs[start : start + local_width]
 
     def _apply(self, x: torch.Tensor, *, inverse: bool) -> torch.Tensor:
         if self._device != x.device:
             self.prepare(x.device)
-        assert self._matrix is not None
-        signs = self._local_signs(x)
-        out = x.to(HADAMARD_COMPUTE_DTYPE)
+        dtype = x.dtype if x.dtype in _LAYOUT_DTYPES else HADAMARD_COMPUTE_DTYPE
+        matrix = self._matrices[dtype]
+        signs = self._local_signs(x, dtype)
+        out = x.to(dtype)
         if not inverse and signs is not None:
             out = out * signs
-        out = (out.reshape(-1, self.block_size) @ self._matrix).reshape(x.shape)
+        out = (out.reshape(-1, self.block_size) @ matrix).reshape(x.shape)
         if inverse and signs is not None:
             out = out * signs
         return out.to(x.dtype)

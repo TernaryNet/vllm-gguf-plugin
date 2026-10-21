@@ -134,6 +134,14 @@ if (
     ) -> torch.Tensor:
         return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
 
+    @register_fake("_C_gguf::ggml_mul_mat_vec_ptq1_0")
+    def _ggml_mul_mat_vec_ptq1_0_fake(
+        W: torch.Tensor,
+        X: torch.Tensor,
+        row: torch.SymInt,
+    ) -> torch.Tensor:
+        return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
+
     @register_fake("_C_gguf::ggml_mul_mat_a8")
     def _ggml_mul_mat_a8_fake(
         W: torch.Tensor,
@@ -197,6 +205,19 @@ def ggml_mul_mat_vec_a8(
     if _cuda_kernel_available("ggml_mul_mat_vec_a8", quant_type):
         return torch.ops._C_gguf.ggml_mul_mat_vec_a8(W, X, quant_type, row)
     return ggml_mul_mat_a8_triton(W, X, quant_type, row)
+
+
+#: Largest batch the dedicated PTQ1_0 mat-vec handles (``PTQ1_0_PT_MAX_COLS``).
+PTQ1_0_MMV_MAX_ROWS = 16
+
+
+def ptq1_0_mmv_available() -> bool:
+    return _cuda_kernel_available("ggml_mul_mat_vec_ptq1_0")
+
+
+def ggml_mul_mat_vec_ptq1_0(W: torch.Tensor, X: torch.Tensor, row: int) -> torch.Tensor:
+    """PTQ1_0 mat-vec that decodes each weight block once for up to 8 rows of X."""
+    return torch.ops._C_gguf.ggml_mul_mat_vec_ptq1_0(W, X, row)
 
 
 def ggml_mul_mat_a8(

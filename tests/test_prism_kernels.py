@@ -90,10 +90,19 @@ def test_ptq1_0_gemm_triton(num_tokens: int, hidden_size: int, dtype: torch.dtyp
     x = torch.rand((num_tokens, hidden_size), dtype=dtype, device="cuda")
     ref = x @ dense.to(dtype).T
     out = ggml_mul_mat_a8_triton(packed, x, QUANT_TYPE, NUM_ROWS)
-    torch.testing.assert_close(out, ref, atol=0.2, rtol=2e-2)
+    # the GEMM quantizes activations to Q8 per 32 elements like MMVQ does
+    torch.testing.assert_close(out, ref, atol=0.5, rtol=2e-2)
+    if ops._CUDA_ENABLED and num_tokens <= 64:
+        mmvq = ops.ggml_mul_mat_vec_a8(packed, x, QUANT_TYPE, NUM_ROWS).to(dtype)
+        atol, rtol = {
+            torch.float32: (1e-3, 1e-4),
+            torch.half: (2e-2, 2e-3),
+            torch.bfloat16: (0.1, 1.6e-2),
+        }[dtype]
+        torch.testing.assert_close(out, mmvq, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 6, 7, 64, 128, 129, 300])
+@pytest.mark.parametrize("num_tokens", [1, 6, 7, 16, 17, 64, 128, 129, 300])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
 @torch.inference_mode()
 def test_ptq1_0_fused_mul_mat_dispatch(num_tokens: int, dtype: torch.dtype):
@@ -104,3 +113,28 @@ def test_ptq1_0_fused_mul_mat_dispatch(num_tokens: int, dtype: torch.dtype):
     ref = x @ dense.to(dtype).T
     out = _fused_mul_mat_gguf(x, packed, int(QUANT_TYPE))
     torch.testing.assert_close(out, ref, atol=0.5, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 8, 9, 16])
+@pytest.mark.parametrize("hidden_size", [384, 1024, 2048, 5120])
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_ptq1_0_mmv_multi_column(num_tokens: int, hidden_size: int, dtype: torch.dtype):
+    """The planar multi-column mat-vec matches the reference and the MMVQ kernel."""
+    if not ops.ptq1_0_mmv_available():
+        pytest.skip("CUDA extension not available")
+    seed_everything(0)
+    packed, dense = _packed(_ternary_weight(NUM_ROWS, hidden_size))
+    x = torch.rand((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    ref = x @ dense.to(dtype).T
+    out = ops.ggml_mul_mat_vec_ptq1_0(packed, x, NUM_ROWS).to(dtype)
+    torch.testing.assert_close(out, ref, atol=0.5, rtol=2e-2)
+    # Same Q8 activation quantization as the generic kernel; only the fp32
+    # summation order differs, plus one output-dtype rounding on each side.
+    mmvq = ops.ggml_mul_mat_vec_a8(packed, x, QUANT_TYPE, NUM_ROWS).to(dtype)
+    atol, rtol = {
+        torch.float32: (1e-3, 1e-4),
+        torch.half: (2e-2, 2e-3),
+        torch.bfloat16: (0.1, 1.6e-2),
+    }[dtype]
+    torch.testing.assert_close(out, mmvq, atol=atol, rtol=rtol)
