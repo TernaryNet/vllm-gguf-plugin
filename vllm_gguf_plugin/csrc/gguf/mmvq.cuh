@@ -86,6 +86,16 @@ static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, scalar_
 }
 
 template<typename scalar_t>
+static void mul_mat_vec_ptq1_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+    const dim3 block_nums(block_num_y, nvecs, 1);
+    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+    // VDR == QI: every lane consumes one whole 128-element block per iteration.
+    mul_mat_vec_q<scalar_t, QK_PTQ1_0, QI_PTQ1_0, block_ptq1_0, VDR_PTQ1_0_Q8_1_MMVQ, vec_dot_ptq1_0_q8_1>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+}
+
+template<typename scalar_t>
 static void mul_mat_vec_q2_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(block_num_y, nvecs, 1);

@@ -64,6 +64,25 @@ typedef struct {
     int8_t  qs[QK8_0];      // quants
 } block_q8_1;
 
+// PrismML PTQ1_0 (GGML type 143, https://github.com/PrismML-Eng/llama.cpp):
+// 128 ternary weights {-1, 0, +1} with one fp16 scale, packed base-3 like
+// llama.cpp's TQ1_0 but at block 128. Element e of a block lives in
+//   qs[e & 15]           as digit (e >> 4)         for e <  80 (16 bytes, 5 trits each)
+//   qs[16 + (e-80) & 7]  as digit ((e-80) >> 3)    for e < 120 ( 8 bytes, 5 trits each)
+//   qh[(e-120) & 1]      as digit ((e-120) >> 1)   for e < 128 ( 2 bytes, 4 trits each)
+// where digit 0 is the most significant base-3 digit. A byte q stores
+// ceil(code * 256 / 243), so digit n is ((q * 3^n & 0xFF) * 3) >> 8 and the
+// weight is (digit - 1) * d.
+#define QK_PTQ1_0 128
+#define QR_PTQ1_0 1
+#define QI_PTQ1_0 (QK_PTQ1_0 / 32)
+typedef struct {
+    uint8_t qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 bytes, 5 trits per byte -> 120 values
+    uint8_t qh[QK_PTQ1_0/64];                   //  2 bytes, 4 trits per byte ->   8 values
+    half    d;                                  // scale
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
+
 #define QR2_K 4
 #define QI2_K (QK_K / (4*QR2_K))
 typedef struct {

@@ -22,6 +22,8 @@ GGML_TYPE_IQ3_S = 21
 GGML_TYPE_IQ2_S = 22
 GGML_TYPE_IQ4_XS = 23
 GGML_TYPE_IQ1_M = 29
+# PrismML ternary (https://github.com/PrismML-Eng/llama.cpp)
+GGML_TYPE_PTQ1_0 = 143
 
 QK = 32
 QK_K = 256
@@ -45,6 +47,8 @@ IQ3_S_BLOCK_BYTES = 110
 IQ2_S_BLOCK_BYTES = 82
 IQ4_XS_BLOCK_BYTES = 136
 IQ1_M_BLOCK_BYTES = 56
+QK_PTQ1_0 = 128
+PTQ1_0_BLOCK_BYTES = 28
 
 BLOCK_BYTES_BY_TYPE = {
     GGML_TYPE_Q4_0: Q4_0_BLOCK_BYTES,
@@ -67,6 +71,7 @@ BLOCK_BYTES_BY_TYPE = {
     GGML_TYPE_IQ2_S: IQ2_S_BLOCK_BYTES,
     GGML_TYPE_IQ4_XS: IQ4_XS_BLOCK_BYTES,
     GGML_TYPE_IQ1_M: IQ1_M_BLOCK_BYTES,
+    GGML_TYPE_PTQ1_0: PTQ1_0_BLOCK_BYTES,
 }
 
 BLOCK_QK_BY_TYPE = {
@@ -90,6 +95,7 @@ BLOCK_QK_BY_TYPE = {
     GGML_TYPE_IQ2_S: QK_K,
     GGML_TYPE_IQ4_XS: QK_K,
     GGML_TYPE_IQ1_M: QK_K,
+    GGML_TYPE_PTQ1_0: QK_PTQ1_0,
 }
 
 TRITON_SUPPORTED_TYPES = frozenset(BLOCK_BYTES_BY_TYPE)
@@ -128,6 +134,25 @@ def load_u16_from_u8(ptrs, mask):
     lo = tl.load(ptrs + 0, mask=mask, other=0).to(tl.uint16)
     hi = tl.load(ptrs + 1, mask=mask, other=0).to(tl.uint16)
     return lo | (hi << 8)
+
+
+@triton.jit
+def load_ptq1_0_trits(block_ptrs, e, mask):
+    """Decode PTQ1_0 elements ``e`` (0..127) of the blocks at ``block_ptrs``.
+
+    ``block_ptrs`` and ``e`` broadcast against each other; the result holds the
+    trits in {-1, 0, 1} as int32. See ``block_ptq1_0`` in ``ggml-common.h``.
+    """
+    in_qs0 = e < 80
+    in_qs1 = (e >= 80) & (e < 120)
+    t1 = e - 80
+    t2 = e - 120
+    byte_idx = tl.where(in_qs0, e & 15, tl.where(in_qs1, 16 + (t1 & 7), 24 + (t2 & 1)))
+    digit = tl.where(in_qs0, e >> 4, tl.where(in_qs1, t1 >> 3, t2 >> 1))
+    v = tl.load(block_ptrs + byte_idx, mask=mask, other=0).to(tl.int32)
+    for step in tl.static_range(4):
+        v = tl.where(step < digit, (v * 3) & 0xFF, v)
+    return ((v * 3) >> 8) - 1
 
 
 @triton.jit

@@ -909,6 +909,95 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+// PrismML PTQ1_0 x Q8_1. VDR == QI, so one call covers the whole 128-element
+// block and iqs is always 0. The four packed bytes of each 32-bit word are
+// spread into two 16-bit lanes so that one multiply by three advances the
+// base-3 digit of four trit streams at once (3 * 255 < 2^16, no cross-lane
+// carry). Digits come out as {0, 1, 2}; the -1 bias is applied through the
+// exact integer activation sums instead of a per-byte subtract.
+#define VDR_PTQ1_0_Q8_1_MMVQ 4
+
+// one digit step on four bytes held as [b0, 0, b1, 0] / [b2, 0, b3, 0]:
+// returns the digits of b0..b3 as four unsigned bytes, advances the remainders
+static __device__ __forceinline__ int ptq1_0_digits4(uint32_t & v_lo, uint32_t & v_hi) {
+    const uint32_t w_lo = v_lo * 3;
+    const uint32_t w_hi = v_hi * 3;
+    v_lo = w_lo & 0x00FF00FF;
+    v_hi = w_hi & 0x00FF00FF;
+    return (int) (((w_lo >> 8) & 0xFF) | (((w_lo >> 24) & 0xFF) << 8) | (((w_hi >> 8) & 0xFF) << 16) | ((w_hi >> 24) << 24));
+}
+
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq;
+    (void) iqs;
+
+    int sumi[4] = {0, 0, 0, 0}; // raw-digit dot products, one per 32-element q8_1 sub-block
+    int sumu[4] = {0, 0, 0, 0}; // activation sums of the same elements
+
+    // qs[0..15]: digit n of byte 4g+b is element 16n + 4g + b
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = (uint32_t) get_int_b4(bq->qs, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed >> 16) & 0xFF) | ((packed >> 24) << 16);
+#pragma unroll
+        for (int n = 0; n < 5; ++n) {
+            const int q = ptq1_0_digits4(v_lo, v_hi);
+            const int e = 16*n + 4*g;
+            const int u = get_int_b4(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = __dp4a(q, u, sumi[e >> 5]);
+            sumu[e >> 5] = __dp4a(0x01010101, u, sumu[e >> 5]);
+        }
+    }
+
+    // qs[16..23]: digit n of byte 16 + 4g + b is element 80 + 8n + 4g + b
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = (uint32_t) get_int_b4(bq->qs + 16, g);
+        uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
+        uint32_t v_hi = ((packed >> 16) & 0xFF) | ((packed >> 24) << 16);
+#pragma unroll
+        for (int n = 0; n < 5; ++n) {
+            const int q = ptq1_0_digits4(v_lo, v_hi);
+            const int e = 80 + 8*n + 4*g;
+            const int u = get_int_b4(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = __dp4a(q, u, sumi[e >> 5]);
+            sumu[e >> 5] = __dp4a(0x01010101, u, sumu[e >> 5]);
+        }
+    }
+
+    // qh[0..1]: digit n of byte h is element 120 + 2n + h, so two digit steps
+    // of the pair [h0, 0, h1, 0] give the four consecutive elements 120 + 2n .. 120 + 2n + 3
+    {
+        uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+#pragma unroll
+        for (int n = 0; n < 4; n += 2) {
+            const uint32_t w0 = v * 3;
+            v = w0 & 0x00FF00FF;
+            const uint32_t w1 = v * 3;
+            v = w1 & 0x00FF00FF;
+            const int q = (int) (((w0 >> 8) & 0xFF) | (((w0 >> 24) & 0xFF) << 8) | (((w1 >> 8) & 0xFF) << 16) | ((w1 >> 24) << 24));
+            const int e = 120 + 2*n;
+            const int u = get_int_b4(bq8_1[3].qs, (e & 31) >> 2);
+            sumi[3] = __dp4a(q, u, sumi[3]);
+            sumu[3] = __dp4a(0x01010101, u, sumu[3]);
+        }
+    }
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc += __low2float(bq8_1[k].ds) * (float) (sumi[k] - sumu[k]);
+    }
+    return __half2float(bq->d) * acc;
+#else
+    (void) vbq; (void) bq8_1; (void) iqs;
+    return 0.0f; // only to satisfy the compiler
+#endif // defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+}
+
 static __device__ __forceinline__ float vec_dot_q8_0_q8_1_mul_mat(
     const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {

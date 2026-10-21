@@ -77,6 +77,42 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v = __hmul2(v, {d, d});
 }
 
+// PTQ1_0 trit of element e, see block_ptq1_0 in ggml-common.h. The base-3
+// digit is pulled out by the remainder recurrence t = (v*3) >> 8, v = (v*3) & 0xFF.
+static __device__ __forceinline__ int ptq1_0_trit(const block_ptq1_0 * x, const int e) {
+    uint8_t b;
+    int n;
+    if (e < 80) {                       // qs[0..15], 16-byte stage
+        b = x->qs[e & 15];              n = e >> 4;
+    } else if (e < 120) {               // qs[16..23], 8-byte stage
+        const int t = e - 80;
+        b = x->qs[16 + (t & 7)];        n = t >> 3;
+    } else {                            // qh[0..1], four trits per byte
+        const int t = e - 120;
+        b = x->qh[t & 1];               n = t >> 1;
+    }
+
+    uint32_t v = b;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (i < n) {
+            v = (v * 3) & 0xFF;
+        }
+    }
+    return (int) ((v * 3) >> 8) - 1;
+}
+
+static __device__ __forceinline__ void dequantize_ptq1_0(const void * vx, const int ib, const int iqs, dfloat2 & v){
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+
+    const dfloat d = x[ib].d;
+
+    v.x = __int2half_rn(ptq1_0_trit(&x[ib], iqs + 0));
+    v.y = __int2half_rn(ptq1_0_trit(&x[ib], iqs + 1));
+
+    v = __hmul2(v, {d, d});
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
     const int64_t i = 2*((int64_t)blockDim.x*blockIdx.x + threadIdx.x);
@@ -565,6 +601,8 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
             return dequantize_row_iq4_xs_cuda;
         case 29:
             return dequantize_row_iq1_m_cuda;
+        case 143:
+            return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
         default:
             return nullptr;
     }

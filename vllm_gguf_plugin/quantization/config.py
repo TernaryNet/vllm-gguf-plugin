@@ -82,14 +82,14 @@ class GGUFConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return GGUFLinearMethod(
                 self,
-                layout=self.linear_layouts.get(prefix),
+                layout=self.resolve_linear_layout(prefix),
             )
         if isinstance(layer, VocabParallelEmbedding):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
                 return UnquantizedEmbeddingMethod()
-            return GGUFEmbeddingMethod(self)
+            return GGUFEmbeddingMethod(self, layout=self.resolve_linear_layout(prefix))
         if isinstance(layer, RoutedExperts):
             return GGUFMoEMethod(self, layer.moe_config)
         return None
@@ -104,6 +104,36 @@ class GGUFConfig(QuantizationConfig):
             (maybe_prefix(prefix, module_name), layout)
             for module_name, layout in layouts.items()
         )
+
+    def resolve_linear_layout(self, prefix: str) -> "GGUFLinearLayout | None":
+        """Return the layout registered for *prefix* or for all of its shards.
+
+        Layouts are registered under the checkpoint's module names. vLLM fuses
+        some of them (``q_proj``/``k_proj``/``v_proj`` -> ``qkv_proj``), in which
+        case every shard must carry the same layout because the fused layer
+        transforms its input only once.
+        """
+        layout = self.linear_layouts.get(prefix)
+        if layout is not None:
+            return layout
+        proj_name = prefix.rsplit(".", 1)[-1]
+        shard_names = self.packed_modules_mapping.get(proj_name)
+        if not shard_names:
+            return None
+        base = prefix[: len(prefix) - len(proj_name)]
+        shard_layouts = [
+            self.linear_layouts.get(base + shard_name) for shard_name in shard_names
+        ]
+        if all(shard_layout is None for shard_layout in shard_layouts):
+            return None
+        first = shard_layouts[0]
+        if any(shard_layout is not first for shard_layout in shard_layouts):
+            raise ValueError(
+                f"Shards of fused GGUF layer {prefix} need different input "
+                f"layouts ({dict(zip(shard_names, shard_layouts))}); all shards "
+                "of a fused layer must share one layout."
+            )
+        return first
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         """

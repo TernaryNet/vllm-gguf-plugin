@@ -212,6 +212,11 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
+      case 143:
+        mul_mat_vec_ptq1_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+        break;
     }
   });
   return Y;

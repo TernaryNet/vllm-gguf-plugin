@@ -189,9 +189,13 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         weight = layer.weight
         weight_type = layer.weight_type.weight_type
         hidden_size = weight.tensor_shape[1]
-        return apply_gguf_embedding_op(
+        out = apply_gguf_embedding_op(
             x, weight, weight_type, hidden_size, dtype=self.params_dtype
         )
+        if self.layout is not None:
+            # Hadamard-latent tables store rotated rows (see ``hadamard.py``).
+            out = self.layout.output_to_vllm(out)
+        return out
 
     def tie_weights(self, layer: torch.nn.Module, embed_tokens: VocabParallelEmbedding):
         del layer

@@ -73,6 +73,35 @@ vllm serve unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_M \
 For a GGUF without a `nextn` block, omit `--speculative-config`; the backbone
 loads normally without MTP.
 
+## PrismML Bonsai (PTQ1_0 ternary)
+
+[PrismML Bonsai 2](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+checkpoints use the private `PTQ1_0` GGML tensor type (type 143: 128 ternary
+weights per block packed base-3 with one fp16 scale, 1.75 bits per weight) and
+store every low-bit matrix in a blockwise Hadamard-rotated basis declared by
+`prism.hadamard.*` metadata. The plugin registers the type with the `gguf`
+package, ships CUDA/Triton dequantize and GEMV kernels for it, and applies the
+sign flip plus normalized Walsh-Hadamard rotation to activations before every
+folded matmul (and the inverse after latent token-embedding lookups), exactly
+as the [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) does.
+
+```bash
+vllm serve prism-ml/Ternary-Bonsai-2-27B-gguf:PTQ1_0 --tokenizer Qwen/Qwen3.8-27B
+vllm serve prism-ml/Ternary-Bonsai-2-2B-gguf:PTQ1_0 --tokenizer Qwen/Qwen3.5-2B
+```
+
+Notes:
+
+- The activation rotation mixes blocks of `prism.hadamard.block_size` input
+  features (1024 for the 27B model), so tensor parallelism must keep whole
+  blocks on every rank: row-parallel inputs of 5120, 6144 and 17408 features
+  limit the 27B model to `--tensor-parallel-size 1`.
+- Only quantized (`PTQ1_0`) folded weights are supported; the `F16` and
+  `PQ2_0` Bonsai files are rejected with an explicit error rather than loaded
+  without their transform.
+- Large batches fall back to dequantize + GEMM; the MMVQ path serves small
+  decode batches.
+
 ## Tested model coverage
 
 The plugin uses vLLM's model implementations and a generic GGUF weight
@@ -93,6 +122,7 @@ starting points:
 | Vision-language | Gemma 4 | Q4_K_M backbone with BF16 projector |
 | Vision-language | Qwen 3.5 | Q4_K_M backbone with BF16 projector |
 | Vision-language | Qwen 3.6 | UD-IQ2_XXS backbone with BF16 projector |
+| Text | PrismML Bonsai 2 (Qwen 3.5/3.8 base) | PTQ1_0 with Hadamard-folded weights |
 | Image generation | Z-Image-Turbo | Q4_0 |
 | Image generation | FLUX.2-klein | Q8_0 |
 

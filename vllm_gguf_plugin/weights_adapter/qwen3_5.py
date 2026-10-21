@@ -11,11 +11,17 @@ import gguf
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
-from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+
+try:
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+    from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+except ImportError:
+    # vLLM dropped its vendored copies once Transformers shipped them.
+    from transformers import Qwen3_5Config, Qwen3_5MoeConfig
 
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
+from ..quantization.hadamard import read_prism_hadamard_spec
 from ..quantization.layout import GGUFHeadTilingLayout, GGUFLinearLayout
 from ..weight_utils import get_gguf_tensor_names, split_stacked_experts
 from .base import BaseGGUFWeightsAdapter, GGUFWeight
@@ -267,10 +273,22 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         name_map: dict[str, str],
     ) -> dict[str, GGUFLinearLayout]:
         """Match vLLM activations to GGML's tiled GDN output weights."""
-        del files
         text_config = model_config.hf_config.get_text_config()
         layout = _gdn_value_head_layout(text_config)
         if layout is None:
+            return {}
+        hadamard_spec = read_prism_hadamard_spec(files.backbone)
+        if hadamard_spec is not None and any(
+            name.endswith(".ssm_out.weight") for name in hadamard_spec.weight_names
+        ):
+            if not hadamard_spec.gdn_v_grouped:
+                raise NotImplementedError(
+                    "Hadamard-folded GDN output projections stored in GGML's "
+                    "tiled value-head order (prism.hadamard.gdn_v_grouped=false) "
+                    "are not supported"
+                )
+            # The fold was computed in vLLM's grouped value-head order and the
+            # stored out_proj columns already follow it, so no tiling layout.
             return {}
         return {
             mapped_name.removesuffix(".weight"): layout

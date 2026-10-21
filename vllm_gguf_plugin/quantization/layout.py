@@ -12,6 +12,8 @@ class GGUFLinearLayout(Protocol):
 
     def input_to_gguf(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    def output_to_vllm(self, x: torch.Tensor) -> torch.Tensor: ...
+
     def weight_to_vllm(
         self,
         weight: torch.Tensor,
@@ -56,6 +58,9 @@ class GGUFHeadTilingLayout:
         num_groups = num_heads // self.heads_per_group
         shape = (*x.shape[:-1], num_groups, self.heads_per_group, self.head_dim)
         return x.reshape(shape).transpose(-3, -2).reshape(x.shape).contiguous()
+
+    def output_to_vllm(self, x: torch.Tensor) -> torch.Tensor:
+        return x
 
     def weight_to_vllm(
         self,

@@ -25,6 +25,7 @@ from .gguf_utils import (
     resolve_explicit_mm_proj,
 )
 from .quantization import GGUFConfig, recursive_replace_vocab_modules
+from .quantization.hadamard import build_hadamard_layouts, read_prism_hadamard_spec
 from .weight_utils import (
     download_gguf,
     download_mmproj,
@@ -176,7 +177,26 @@ class GGUFModelLoader(BaseModelLoader):
         unquantized_modules = _get_unquantized_modules(files, name_map) + tuple(
             adapter.extra_unquantized_modules
         )
-        linear_layouts = adapter.get_linear_layouts(files, model_config, name_map)
+        linear_layouts = dict(adapter.get_linear_layouts(files, model_config, name_map))
+
+        hadamard_spec = read_prism_hadamard_spec(files.backbone)
+        if hadamard_spec is not None:
+            hadamard_layouts = build_hadamard_layouts(hadamard_spec, name_map)
+            conflicts = sorted(set(hadamard_layouts) & set(linear_layouts))
+            if conflicts:
+                raise NotImplementedError(
+                    "GGUF modules that need both a head-tiling layout and a "
+                    f"Hadamard transform are not supported: {conflicts}"
+                )
+            linear_layouts.update(hadamard_layouts)
+            logger.info(
+                "Loaded %d Hadamard-folded GGUF weight(s) (%d inverse-lookup) "
+                "with block size %d, version %d",
+                len(hadamard_spec.folded_names),
+                len(hadamard_spec.inverse_weight_names),
+                hadamard_spec.block_size,
+                hadamard_spec.version,
+            )
         return adapter, GGUFLoadPlan(
             files, name_map, unquantized_modules, linear_layouts
         )

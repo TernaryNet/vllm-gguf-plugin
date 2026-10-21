@@ -10,6 +10,7 @@ from ..gemm.utils import (
     GGML_TYPE_IQ3_XXS,
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_IQ4_XS,
+    GGML_TYPE_PTQ1_0,
     GGML_TYPE_Q2_K,
     GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_0,
@@ -40,6 +41,7 @@ from .k_quant import (
     ggml_dequantize_q5_k_triton,
     ggml_dequantize_q6_k_triton,
 )
+from .prism_quant import ggml_dequantize_ptq1_0_triton
 from .standard_quant import (
     ggml_dequantize_q4_0_triton,
     ggml_dequantize_q4_1_triton,
@@ -78,6 +80,7 @@ def ggml_dequantize_triton(
         GGML_TYPE_Q6_K: ggml_dequantize_q6_k_triton,
         GGML_TYPE_Q8_0: ggml_dequantize_q8_0_triton,
         GGML_TYPE_Q8_1: ggml_dequantize_q8_1_triton,
+        GGML_TYPE_PTQ1_0: ggml_dequantize_ptq1_0_triton,
     }.get(int(quant_type))
     if kernel is None:
         raise ValueError(f"Unsupported Triton dequant quant type: {quant_type}")
