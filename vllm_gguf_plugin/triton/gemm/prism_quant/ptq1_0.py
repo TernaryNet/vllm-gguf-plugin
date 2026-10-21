@@ -10,24 +10,10 @@ from ..utils import GGML_TYPE_PTQ1_0, _validate_args, load_f16_from_u8
 # matmul in a separate pass, so every N tile of the GEMM reads int8 tiles and
 # all dispatch tiers see the same activation rounding.
 PTQ1_0_GEMM_BLOCK_M = 128
-PTQ1_0_GEMM_BLOCK_N = 64
-
-
-@triton.jit
-def _ptq1_0_byte_map(e):
-    """Byte index and base-3 power for block element ``e`` (see ggml-common.h)."""
-    in_qs0 = e < 80
-    in_qs1 = (e >= 80) & (e < 120)
-    t1 = e - 80
-    t2 = e - 120
-    byte_idx = tl.where(in_qs0, e & 15, tl.where(in_qs1, 16 + (t1 & 7), 24 + (t2 & 1)))
-    digit = tl.where(in_qs0, e >> 4, tl.where(in_qs1, t1 >> 3, t2 >> 1))
-    pow3 = tl.where(
-        digit == 0,
-        1,
-        tl.where(digit == 1, 3, tl.where(digit == 2, 9, tl.where(digit == 3, 27, 81))),
-    )
-    return byte_idx, pow3
+# Swept on an L4 for the Bonsai-27B shapes: a 128-wide N tile wins at every
+# batch, 4 warps up to a 64-row M tile and 8 warps at 128, and software
+# pipelining only pays off for the 128-row tile.
+PTQ1_0_GEMM_BLOCK_N = 128
 
 
 @triton.jit
@@ -67,36 +53,27 @@ def quantize_q8_sub_blocks_kernel(
 
 
 @triton.jit
-def _ptq1_0_sub_block(
-    q_row_ptrs,
-    d_row_ptrs,
-    isum_row_ptrs,
-    m_mask,
-    block_ptrs,
-    n_mask,
-    sub_index,
-    byte_idx,
-    pow3,
-    d_w,
-    acc,
-):
-    """Accumulate one 32-element sub-block: Q8(x) . trits, rescaled."""
-    offs_s = tl.arange(0, 32)
-    q = tl.load(
-        q_row_ptrs[:, None] + sub_index * 32 + offs_s[None, :],
-        mask=m_mask[:, None],
-        other=0,
-    )
-    d_x = tl.load(d_row_ptrs + sub_index, mask=m_mask, other=0.0).to(tl.float32)
-    isum = tl.load(isum_row_ptrs + sub_index, mask=m_mask, other=0)
+def _trit_digit(packed, n: tl.constexpr):
+    """Base-3 digit ``n`` (0 = most significant) of each packed byte."""
+    pow3: tl.constexpr = 3**n
+    return (((packed * pow3) & 0xFF) * 3) >> 8
 
-    raw = tl.load(
-        block_ptrs[:, None] + byte_idx[None, :], mask=n_mask[:, None], other=0
-    )
-    raw = raw.to(tl.int32)
-    # digits {0, 1, 2}; the -1 bias is applied through the activation sums
-    digits = ((((raw * pow3[None, :]) & 0xFF) * 3) >> 8).to(tl.int8)
-    dot = tl.dot(q, tl.trans(digits), out_dtype=tl.int32)
+
+@triton.jit
+def _trit_digits2(packed, n_first: tl.constexpr):
+    """Digits n_first and n_first + 1 of [BLOCK_N, W] bytes as [BLOCK_N, 2 * W].
+
+    Digit index major, matching GGML's element order e = W * n + m.
+    """
+    pair = tl.join(_trit_digit(packed, n_first), _trit_digit(packed, n_first + 1))
+    # join interleaves along a trailing axis: [BLOCK_N, W, 2] -> permute to
+    # [BLOCK_N, 2, W] so the digit index is the major one
+    pair = tl.permute(pair, (0, 2, 1))
+    return tl.reshape(pair, (pair.shape[0], pair.shape[1] * pair.shape[2]))
+
+
+@triton.jit
+def _scaled_dot(dot, isum, d_x, d_w, acc):
     return acc + (dot - isum[:, None]).to(tl.float32) * (d_x[:, None] * d_w[None, :])
 
 
@@ -116,18 +93,36 @@ def ptq1_0_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    """Y = X @ W^T for PTQ1_0 weights and pre-quantized Q8 activations.
+
+    Each 128-weight block is decoded from three contiguous byte loads
+    (qs[0:16], qs[16:24], qh[0:2]); see block_ptq1_0 in ggml-common.h for the
+    element order, which fixes which digits feed each 32-element sub-block.
+    """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_s = tl.arange(0, 32)
     m_mask = offs_m < m
     n_mask = offs_n < n
-    byte0, pow0 = _ptq1_0_byte_map(offs_s)
-    byte1, pow1 = _ptq1_0_byte_map(32 + offs_s)
-    byte2, pow2 = _ptq1_0_byte_map(64 + offs_s)
-    byte3, pow3 = _ptq1_0_byte_map(96 + offs_s)
+    offs_16 = tl.arange(0, 16)
+    offs_8 = tl.arange(0, 8)
+    offs_2 = tl.arange(0, 2)
+    offs_32 = tl.arange(0, 32)
+    # int8 tl.dot needs K >= 32, so sub-blocks 2 and 3 join two 16-element
+    # digit groups. tl.join interleaves (a0, b0, a1, b1, ...), so the
+    # activation columns are gathered in that same order.
+    half = offs_32 >> 1
+    odd = (offs_32 & 1) == 1
+    # sub-block 2: a = elements 64..79 (digit 4 of qs[0:16]),
+    #              b = elements 80..95 (digits 0, 1 of qs[16:24])
+    cols2 = tl.where(odd, 80 + half, 64 + half)
+    # sub-block 3: a = elements 96..111 (digits 2, 3 of qs[16:24]),
+    #              b = join(112..119 (digit 4 of qs[16:24]), 120..127 (qh))
+    cols3 = tl.where(
+        odd, tl.where((half & 1) == 1, 120 + (half >> 1), 112 + (half >> 1)), 96 + half
+    )
 
     num_sub_blocks = num_k_blocks * 4
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -139,59 +134,61 @@ def ptq1_0_gemm_kernel(
     for kb in range(0, num_k_blocks):
         block_ptrs = w_row_ptrs + kb * 28
         d_w = load_f16_from_u8(block_ptrs + 26, n_mask).to(tl.float32)
+        qs0 = tl.load(
+            block_ptrs[:, None] + offs_16[None, :], mask=n_mask[:, None], other=0
+        )
+        qs1 = tl.load(
+            block_ptrs[:, None] + 16 + offs_8[None, :], mask=n_mask[:, None], other=0
+        )
+        qh = tl.load(
+            block_ptrs[:, None] + 24 + offs_2[None, :], mask=n_mask[:, None], other=0
+        )
+        qs0 = qs0.to(tl.int32)
+        qs1 = qs1.to(tl.int32)
+        qh = qh.to(tl.int32)
+        q_block = q_row_ptrs[:, None] + kb * 128
         s0 = kb * 4
-        acc = _ptq1_0_sub_block(
-            q_row_ptrs,
-            d_row_ptrs,
-            isum_row_ptrs,
-            m_mask,
-            block_ptrs,
-            n_mask,
-            s0,
-            byte0,
-            pow0,
-            d_w,
-            acc,
+
+        # sub-block 0: elements 0..31 = digits 0, 1 of qs[0:16]
+        q_tile = tl.load(q_block + offs_32[None, :], mask=m_mask[:, None], other=0)
+        w_tile = _trit_digits2(qs0, 0).to(tl.int8)
+        dot = tl.dot(q_tile, tl.trans(w_tile), out_dtype=tl.int32)
+        d_x = tl.load(d_row_ptrs + s0, mask=m_mask, other=0.0).to(tl.float32)
+        isum = tl.load(isum_row_ptrs + s0, mask=m_mask, other=0)
+        acc = _scaled_dot(dot, isum, d_x, d_w, acc)
+
+        # sub-block 1: elements 32..63 = digits 2, 3 of qs[0:16]
+        q_tile = tl.load(q_block + 32 + offs_32[None, :], mask=m_mask[:, None], other=0)
+        w_tile = _trit_digits2(qs0, 2).to(tl.int8)
+        dot = tl.dot(q_tile, tl.trans(w_tile), out_dtype=tl.int32)
+        d_x = tl.load(d_row_ptrs + s0 + 1, mask=m_mask, other=0.0).to(tl.float32)
+        isum = tl.load(isum_row_ptrs + s0 + 1, mask=m_mask, other=0)
+        acc = _scaled_dot(dot, isum, d_x, d_w, acc)
+
+        # sub-block 2
+        q_tile = tl.load(q_block + cols2[None, :], mask=m_mask[:, None], other=0)
+        w_tile = tl.reshape(
+            tl.join(_trit_digit(qs0, 4), _trit_digits2(qs1, 0)), (BLOCK_N, 32)
+        ).to(tl.int8)
+        dot = tl.dot(q_tile, tl.trans(w_tile), out_dtype=tl.int32)
+        d_x = tl.load(d_row_ptrs + s0 + 2, mask=m_mask, other=0.0).to(tl.float32)
+        isum = tl.load(isum_row_ptrs + s0 + 2, mask=m_mask, other=0)
+        acc = _scaled_dot(dot, isum, d_x, d_w, acc)
+
+        # sub-block 3
+        q_tile = tl.load(q_block + cols3[None, :], mask=m_mask[:, None], other=0)
+        qh_digits = tl.reshape(
+            tl.permute(tl.join(_trit_digits2(qh, 0), _trit_digits2(qh, 2)), (0, 2, 1)),
+            (BLOCK_N, 8),
+        )  # elements 120..127 in order
+        tail = tl.reshape(tl.join(_trit_digit(qs1, 4), qh_digits), (BLOCK_N, 16))
+        w_tile = tl.reshape(tl.join(_trit_digits2(qs1, 2), tail), (BLOCK_N, 32)).to(
+            tl.int8
         )
-        acc = _ptq1_0_sub_block(
-            q_row_ptrs,
-            d_row_ptrs,
-            isum_row_ptrs,
-            m_mask,
-            block_ptrs,
-            n_mask,
-            s0 + 1,
-            byte1,
-            pow1,
-            d_w,
-            acc,
-        )
-        acc = _ptq1_0_sub_block(
-            q_row_ptrs,
-            d_row_ptrs,
-            isum_row_ptrs,
-            m_mask,
-            block_ptrs,
-            n_mask,
-            s0 + 2,
-            byte2,
-            pow2,
-            d_w,
-            acc,
-        )
-        acc = _ptq1_0_sub_block(
-            q_row_ptrs,
-            d_row_ptrs,
-            isum_row_ptrs,
-            m_mask,
-            block_ptrs,
-            n_mask,
-            s0 + 3,
-            byte3,
-            pow3,
-            d_w,
-            acc,
-        )
+        dot = tl.dot(q_tile, tl.trans(w_tile), out_dtype=tl.int32)
+        d_x = tl.load(d_row_ptrs + s0 + 3, mask=m_mask, other=0.0).to(tl.float32)
+        isum = tl.load(isum_row_ptrs + s0 + 3, mask=m_mask, other=0)
+        acc = _scaled_dot(dot, isum, d_x, d_w, acc)
 
     y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
     tl.store(y_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
@@ -242,8 +239,8 @@ def ggml_gemm_ptq1_0_triton(W: torch.Tensor, X: torch.Tensor, row: int) -> torch
         y_2d.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=PTQ1_0_GEMM_BLOCK_N,
-        num_warps=max(2, block_m // 16),
-        num_stages=2,
+        num_warps=8 if block_m >= 128 else 4,
+        num_stages=2 if block_m >= 128 else 1,
     )
     if len(x_shape) == 2:
         return y_2d

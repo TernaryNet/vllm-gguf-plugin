@@ -33,13 +33,14 @@ from .utils import (
 )
 
 # PTQ1_0 has no MMQ kernel. Measured on an L4 for the Bonsai-27B shapes with
-# weights streaming from HBM: the planar multi-column mat-vec decodes each
-# weight block once for up to 16 rows (0.16 ms at batch 1 for the 5120->34816
-# layer, 0.64 ms at batch 16), the Triton GEMM with pre-quantized int8
-# activations is cheaper from 17 rows (1.0 ms at 48, 1.6 ms at 128, 3.1 ms at
-# 256 rows) up to 256, and dequantize + cuBLAS (4.4-5.0 ms) only wins beyond
-# that. The generic MMVQ kernel re-reads the weights per row and is only the
-# fallback without the dedicated kernel.
+# weights streaming from HBM (5120->34816 layer): the planar multi-column
+# mat-vec decodes each weight block once (0.16 ms at batch 1, 0.33 ms at 8),
+# the Triton GEMM with pre-quantized int8 activations takes over from 9 rows
+# (0.32 ms at 16, 0.45 at 32, 1.0 at 48, 1.7 at 128, 3.4 at 256) up to 256,
+# and dequantize + cuBLAS (4.2-5.0 ms) only wins beyond that. The generic
+# MMVQ kernel re-reads the weights per row and is only the fallback without
+# the dedicated kernel.
+_PRISM_MMV_MAX_ROWS = 8
 _PRISM_MMVQ_MAX_ROWS = 6
 _PRISM_TRITON_GEMM_MAX_ROWS = 256
 # Dequantize wide weights (the 248k-row Bonsai head) in row chunks so the bf16
@@ -59,7 +60,7 @@ def _fused_mul_mat_gguf(
     if weight_type in UNQUANTIZED_TYPES:
         return x @ weight.T
     if weight_type in PRISM_TERNARY_TYPES:
-        if x.shape[0] <= ops.PTQ1_0_MMV_MAX_ROWS and ops.ptq1_0_mmv_available():
+        if x.shape[0] <= _PRISM_MMV_MAX_ROWS and ops.ptq1_0_mmv_available():
             return ops.ggml_mul_mat_vec_ptq1_0(weight, x, weight.shape[0])
         if x.shape[0] <= _PRISM_MMVQ_MAX_ROWS:
             return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])

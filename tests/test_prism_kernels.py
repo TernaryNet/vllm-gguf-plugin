@@ -102,7 +102,9 @@ def test_ptq1_0_gemm_triton(num_tokens: int, hidden_size: int, dtype: torch.dtyp
         torch.testing.assert_close(out, mmvq, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 6, 7, 16, 17, 64, 128, 129, 256, 257, 300])
+@pytest.mark.parametrize(
+    "num_tokens", [1, 6, 7, 8, 9, 16, 17, 64, 128, 129, 256, 257, 300]
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
 @torch.inference_mode()
 def test_ptq1_0_fused_mul_mat_dispatch(num_tokens: int, dtype: torch.dtype):
