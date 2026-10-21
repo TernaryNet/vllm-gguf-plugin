@@ -300,6 +300,7 @@ def run_triton_kernel(
     extra_args: tuple = (),
     block_m: int = TRITON_BLOCK_M,
     block_n: int = TRITON_BLOCK_N,
+    num_warps: int = TRITON_NUM_WARPS,
 ) -> torch.Tensor:
     W, X_2d, X_shape, num_k_blocks = _validate_args(W, X, row, quant_type)
     Y_2d = torch.empty((X_2d.shape[0], row), device=X.device, dtype=X.dtype)
@@ -325,7 +326,7 @@ def run_triton_kernel(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K_BLOCKS=TRITON_BLOCK_K_BLOCKS,
-        num_warps=TRITON_NUM_WARPS,
+        num_warps=num_warps,
         num_stages=TRITON_NUM_STAGES,
     )
 

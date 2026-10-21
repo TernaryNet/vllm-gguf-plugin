@@ -35,12 +35,13 @@ from .utils import (
 # PTQ1_0 has no MMQ kernel. Measured on an L4 for the Bonsai-27B shapes with
 # weights streaming from HBM: the planar multi-column mat-vec decodes each
 # weight block once for up to 16 rows (0.16 ms at batch 1 for the 5120->34816
-# layer, 0.67 ms at batch 16), the Triton GEMM is cheaper from 17 rows up to
-# about 128, and dequantize + cuBLAS only wins beyond that. The generic MMVQ
-# kernel re-reads the weights per row and is only the fallback without the
-# dedicated kernel.
+# layer, 0.64 ms at batch 16), the Triton GEMM with pre-quantized int8
+# activations is cheaper from 17 rows (1.0 ms at 48, 1.6 ms at 128, 3.1 ms at
+# 256 rows) up to 256, and dequantize + cuBLAS (4.4-5.0 ms) only wins beyond
+# that. The generic MMVQ kernel re-reads the weights per row and is only the
+# fallback without the dedicated kernel.
 _PRISM_MMVQ_MAX_ROWS = 6
-_PRISM_TRITON_GEMM_MAX_ROWS = 128
+_PRISM_TRITON_GEMM_MAX_ROWS = 256
 # Dequantize wide weights (the 248k-row Bonsai head) in row chunks so the bf16
 # copy stays well under the whole-matrix footprint.
 _PRISM_DEQUANT_ROW_CHUNK = 16384

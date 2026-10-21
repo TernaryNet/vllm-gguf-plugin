@@ -92,6 +92,31 @@ def llamacpp_run(server_bin, gguf, prompts, max_tokens, port=8099):
     finally:
         proc.terminate()
         proc.wait(timeout=30)
+        _wait_for_gpu_memory_release()
+
+
+def _wait_for_gpu_memory_release(timeout_s: float = 60.0) -> None:
+    """Block until free GPU memory stops changing.
+
+    vLLM's memory profiler aborts if another process releases GPU memory
+    while it runs, and a terminated llama-server can take a few seconds to
+    hand its allocations back.
+    """
+    import torch
+
+    deadline = time.time() + timeout_s
+    previous = None
+    stable_since = None
+    while time.time() < deadline:
+        free, _ = torch.cuda.mem_get_info()
+        if previous is not None and abs(free - previous) < (16 << 20):
+            stable_since = stable_since or time.time()
+            if time.time() - stable_since >= 3.0:
+                return
+        else:
+            stable_since = None
+        previous = free
+        time.sleep(0.5)
 
 
 def vllm_run(model, tokenizer, prompts, max_tokens):
