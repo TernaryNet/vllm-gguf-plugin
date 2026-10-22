@@ -137,7 +137,11 @@ class GGUFModelLoader(BaseModelLoader):
                 self._mm_proj_reference,
                 model_path,
                 cache_dir=self.load_config.download_dir,
-                revision=model_config.revision,
+                revision=_revision_for_weights_repo(
+                    model_config,
+                    get_remote_gguf_repo_id(self._mm_proj_reference)
+                    or model_config.model,
+                ),
             )
         elif detected := detect_gguf_multimodal(model_path):
             mm_proj = str(detected)
@@ -149,7 +153,7 @@ class GGUFModelLoader(BaseModelLoader):
                 mm_proj = download_mmproj(
                     repo_id,
                     cache_dir=self.load_config.download_dir,
-                    revision=model_config.revision,
+                    revision=_revision_for_weights_repo(model_config, repo_id),
                 )
 
         return GGUFModelFiles(

@@ -360,3 +360,64 @@ class TestGGUFModelLoader:
             ("/cache/model-Q4_0.gguf",), "/cache/mmproj-BF16.gguf"
         )
         assert download_calls == [("org/model", None, "main")]
+
+    def test_prepare_model_files_remote_mmproj_uses_weights_repo_revision(
+        self, monkeypatch
+    ):
+        """A ResolvedRevision bound to the config repo must not be reused for
+        the weights repo: its SHA does not exist there (404 on download)."""
+        loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
+        model_config = SimpleNamespace(
+            model_weights="org/weights-repo:Q4_0",
+            model="org/config-repo",
+            revision=ResolvedRevision(initial=None, resolved="deadbeef"),
+            hf_config=SimpleNamespace(vision_config=object()),
+        )
+        monkeypatch.setattr(
+            loader, "_prepare_weights", lambda config: "/cache/model-Q4_0.gguf"
+        )
+        download_calls = []
+
+        def fake_download(repo_id, cache_dir=None, revision=None):
+            download_calls.append((repo_id, cache_dir, revision))
+            return "/cache/mmproj-BF16.gguf"
+
+        monkeypatch.setattr(loader_module, "download_mmproj", fake_download)
+
+        files = loader._prepare_model_files(model_config)
+
+        assert files.mm_proj == "/cache/mmproj-BF16.gguf"
+        assert download_calls == [("org/weights-repo", None, None)]
+
+    def test_prepare_model_files_explicit_remote_mmproj_uses_weights_repo_revision(
+        self, monkeypatch
+    ):
+        loader = GGUFModelLoader(
+            LoadConfig(
+                load_format="gguf",
+                model_loader_extra_config={"mm_proj": "org/weights-repo/mmproj.gguf"},
+            )
+        )
+        model_config = SimpleNamespace(
+            model_weights="org/weights-repo:Q4_0",
+            model="org/config-repo",
+            revision=ResolvedRevision(initial="v1", resolved="deadbeef"),
+            hf_config=SimpleNamespace(),
+        )
+        monkeypatch.setattr(
+            loader, "_prepare_weights", lambda config: "/cache/model-Q4_0.gguf"
+        )
+        resolve_calls = []
+
+        def fake_resolve(reference, model_path, *, cache_dir=None, revision=None):
+            resolve_calls.append((reference, model_path, cache_dir, revision))
+            return "/cache/mmproj.gguf"
+
+        monkeypatch.setattr(loader_module, "resolve_explicit_mm_proj", fake_resolve)
+
+        files = loader._prepare_model_files(model_config)
+
+        assert files.mm_proj == "/cache/mmproj.gguf"
+        assert resolve_calls == [
+            ("org/weights-repo/mmproj.gguf", "/cache/model-Q4_0.gguf", None, "v1")
+        ]
