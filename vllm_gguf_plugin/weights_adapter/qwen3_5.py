@@ -401,6 +401,8 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
 class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
     """Qwen3.5/3.6 single-block MTP draft stored in a GGUF nextn block."""
 
+    loads_part_of_file = True
+
     #: embed_tokens/lm_head are shared from the target model after loading,
     #: so they must stay ordinary vocab modules that never expect GGUF weights.
     extra_unquantized_modules = ("embed_tokens", "lm_head")

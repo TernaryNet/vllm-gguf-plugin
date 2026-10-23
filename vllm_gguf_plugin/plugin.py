@@ -86,14 +86,28 @@ def _patch_engine_args() -> None:
         if self.speculative_config is not None:
             configured_model = configured_model or self.speculative_config.get("model")
 
-        config = original_create_speculative_config(self, *args, **kwargs)
         gguf_model = self.model_weights
-        if (
-            config is not None
-            and config.method == "mtp"
+        same_file_mtp = (
+            self.speculative_config is not None
             and configured_model is None
+            and self.speculative_config.get("method") == "mtp"
             and _is_gguf_reference(gguf_model)
-        ):
+        )
+        if same_file_mtp:
+            # vLLM builds the draft's ModelConfig from the draft "model", which for
+            # an MTP head in the same GGUF defaults to the target's weights reference.
+            # A GGUF on disk cannot be that config source (its directory holds no
+            # config.json and a file path is no Hub repo for the processor lookups),
+            # so point the draft at the config source the target itself used -- the
+            # tokenizer repo or --hf-config-path -- and keep the GGUF as its weights.
+            self.speculative_config = dict(self.speculative_config)
+            self.speculative_config["model"] = _get_gguf_config_source(
+                gguf_model,
+                self.tokenizer if isinstance(self.tokenizer, str) else None,
+                self.hf_config_path,
+            )
+        config = original_create_speculative_config(self, *args, **kwargs)
+        if config is not None and config.method == "mtp" and same_file_mtp:
             config.draft_model_config.model_weights = gguf_model
         return config
 

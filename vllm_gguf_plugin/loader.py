@@ -185,7 +185,9 @@ class GGUFModelLoader(BaseModelLoader):
 
         hadamard_spec = read_prism_hadamard_spec(files.backbone)
         if hadamard_spec is not None:
-            hadamard_layouts = build_hadamard_layouts(hadamard_spec, name_map)
+            hadamard_layouts = build_hadamard_layouts(
+                hadamard_spec, name_map, mapped_only=adapter.loads_part_of_file
+            )
             conflicts = sorted(set(hadamard_layouts) & set(linear_layouts))
             if conflicts:
                 raise NotImplementedError(

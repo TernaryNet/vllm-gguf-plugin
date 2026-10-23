@@ -24,6 +24,11 @@ GGUFWeight = tuple[str, torch.Tensor]
 class BaseGGUFWeightsAdapter(ABC):
     """Model-specific GGUF name mapping and tensor transformation hooks."""
 
+    #: True for an adapter that loads one part of the file (an MTP draft reads
+    #: its ``nextn`` block; the backbone belongs to the target), so checks over
+    #: the file's tensors apply to the mapped ones only.
+    loads_part_of_file: bool = False
+
     #: Modules that never load weights from GGUF (e.g. shared with the target
     #: model in speculative decoding) and must stay unquantized.
     extra_unquantized_modules: tuple[str, ...] = ()
