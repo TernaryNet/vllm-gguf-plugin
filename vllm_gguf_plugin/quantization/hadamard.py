@@ -443,15 +443,21 @@ class GGUFHadamardLayout:
 def build_hadamard_layouts(
     spec: PrismHadamardSpec,
     name_map: Mapping[str, str],
+    mapped_only: bool = False,
 ) -> dict[str, GGUFHadamardLayout]:
     """Map vLLM module names to the transforms their folded weights need.
 
     *name_map* translates GGUF tensor names to vLLM parameter names; fused
     modules (``qkv_proj`` etc.) are resolved later by the quantization config
-    from their shard names.
+    from their shard names. With *mapped_only* the folded tensors outside
+    *name_map* are left alone instead of refused: the caller loads one part
+    of the file (an MTP draft) and the rest is the target's.
     """
+    folded_names = spec.folded_names
+    if mapped_only:
+        folded_names = frozenset(name for name in folded_names if name in name_map)
     folded_float = sorted(
-        name for name in spec.folded_names if spec.tensor_types[name] in _FLOAT_TYPES
+        name for name in folded_names if spec.tensor_types[name] in _FLOAT_TYPES
     )
     if folded_float:
         raise NotImplementedError(
@@ -459,7 +465,7 @@ def build_hadamard_layouts(
             f"(use a PTQ1_0 file): {folded_float}"
         )
 
-    unmapped = sorted(name for name in spec.folded_names if name not in name_map)
+    unmapped = sorted(name for name in folded_names if name not in name_map)
     if unmapped:
         raise ValueError(
             "Hadamard-folded GGUF tensors without a vLLM parameter mapping; "
@@ -469,7 +475,7 @@ def build_hadamard_layouts(
     shared: dict[tuple[int, bool, bool], GGUFHadamardLayout] = {}
     layouts: dict[str, GGUFHadamardLayout] = {}
     inverse_names = frozenset(spec.inverse_weight_names)
-    for name in spec.folded_names:
+    for name in folded_names:
         forward = (
             name in spec.weight_names or spec.tied_output and name in inverse_names
         )
