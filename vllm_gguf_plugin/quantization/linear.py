@@ -53,11 +53,12 @@ _PRISM_TRITON_GEMM_MAX_ROWS = 256
 # copy stays well under the whole-matrix footprint.
 _PRISM_DEQUANT_ROW_CHUNK = 16384
 
-#: ``VLLM_GGUF_SMALL_M_GEMV=1``: unquantized linears with at most
-#: ``_SMALL_M_GEMV_MAX_OUT`` output rows run 2-8 activation rows through the
+#: ``VLLM_GGUF_SMALL_M_GEMV``: ``1`` (default) runs unquantized linears with at
+#: most ``_SMALL_M_GEMV_MAX_OUT`` output rows at 2-4 activation rows through the
 #: plugin's one-CTA-per-row kernel instead of cuBLAS, which picks a slow
-#: tensor-core tile for Bonsai's [96, 5120] BF16 in_proj_ba there. Default off.
-_SMALL_M_GEMV = os.environ.get("VLLM_GGUF_SMALL_M_GEMV", "0") == "1"
+#: tensor-core tile for Bonsai's [96, 5120] BF16 in_proj_ba there (L40S: 27-36
+#: us -> 3-4 us, -1.3 ms a 4-stream step); ``0`` keeps cuBLAS.
+_SMALL_M_GEMV = os.environ.get("VLLM_GGUF_SMALL_M_GEMV", "1") == "1"
 _SMALL_M_GEMV_MAX_OUT = 1024
 # L40S, [96, 5120]: 2.8-3.7 us at 2-4 rows vs cuBLAS 27.5; at 8 rows cuBLAS picks
 # a good kernel (5.1 vs 5.8 us), 5-7 rows unmeasured
@@ -231,14 +232,15 @@ try:
 except AttributeError as error:
     raise error
 
-#: ``VLLM_GGUF_FUSED_ROT``: ``1`` runs Hadamard-folded PTQ1_0 linears at 1-8
+#: ``VLLM_GGUF_FUSED_ROT``: ``1`` (default) runs Hadamard-folded PTQ1_0 linears at 1-8
 #: rows through one kernel that applies the signs, the 1024-point FWHT (fp32,
 #: rounded once to the activation dtype) and the Q8 quantize before the
 #: mat-vec (``ggml_mul_mat_vec_ptq1_0_rot``) -- the same activation values the
 #: dense ``x @ H`` path produces, without its GEMM and quantize launches. Rows
 #: above 8 (prefill) take the dense rotation and the regular tiers inside the
-#: op, so they match the unfused path too. ``0`` (default) keeps the separate
-#: rotation (Hadacore or dense, ``VLLM_GGUF_HADACORE``) + quantize.
+#: op. ``0`` keeps the separate rotation (Hadacore or dense,
+#: ``VLLM_GGUF_HADACORE``) + quantize. L40S, 1 stream: -3.1 ms a step with the
+#: planar mat-vec (15.15 -> 12.07 ms), of which -0.6 ms against Hadacore.
 FUSED_ROT_ENV = "VLLM_GGUF_FUSED_ROT"
 
 
@@ -418,7 +420,7 @@ class GGUFLinearMethod(LinearMethodBase):
 
         from .hadamard import GGUFHadamardLayout
 
-        mode = os.environ.get(FUSED_ROT_ENV, "0").strip()
+        mode = os.environ.get(FUSED_ROT_ENV, "1").strip()
         if mode not in ("0", "1"):
             raise ValueError(f"{FUSED_ROT_ENV} must be 0 or 1, got {mode!r}")
         layout = self.layout
