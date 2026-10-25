@@ -298,6 +298,31 @@ def check_fused():
     return 0
 
 
+def check_fused_prefill():
+    """The fused op with GGML-order vs planar weights at the model's real row counts and
+    prefill-sized inputs (Triton tier, dequant + cuBLAS tier with row chunks): must agree
+    bit for bit (diagnoses engine-level differences between the two layouts)."""
+    torch.manual_seed(0)
+    for name, (rows, k) in SHAPES.items():
+        if name == "lm_head":
+            continue
+        base = packed_ptq(min(rows, 4096), k, seed=3)
+        w = base.repeat(-(-rows // base.shape[0]), 1)[:rows].contiguous()
+        wp = planar_copy(w)
+        hc, dense, _ = layouts(k, seed=k + 5)
+        sg = dense._signs[torch.float32]
+        for n in (1, 2, 8, 9, 40, 256, 257, 2048):
+            x = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+            args = (sg, dense._signs[torch.bfloat16], dense._matrices[torch.bfloat16])
+            a = linear._fused_rot_mul_mat_gguf(x, w, PTQ, *args)
+            b = linear._fused_rot_mul_mat_gguf(x, wp, PLANAR, *args)
+            expect(f"fused op GGML == planar {name} rows={rows} n={n}", torch.equal(a, b),
+                   f"max|diff|={(a.float() - b.float()).abs().max().item():.3g}")
+        del w, wp
+        torch.cuda.empty_cache()
+    return 0
+
+
 # --- benches -------------------------------------------------------------------
 
 
@@ -400,6 +425,7 @@ def main():
     parser.add_argument("--hadamard", action="store_true")
     parser.add_argument("--planar", action="store_true")
     parser.add_argument("--fused", action="store_true")
+    parser.add_argument("--fused-prefill", action="store_true", help="fused op GGML vs planar at real shapes")
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--bench-shapes", nargs="*", help="subset of the bench shapes")
     parser.add_argument("--bench-small-m", action="store_true", help="in_proj_ba-shaped BF16 GEMM variants")
@@ -409,11 +435,12 @@ def main():
           f"gpu={torch.cuda.get_device_name()} utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
           f"env VLLM_GGUF_HADACORE={os.environ.get('VLLM_GGUF_HADACORE', '(unset)')} "
           f"VLLM_GGUF_PTQ1_0_PLANAR={os.environ.get('VLLM_GGUF_PTQ1_0_PLANAR', '(unset)')}", flush=True)
-    if not (args.hadamard or args.planar or args.fused or args.bench or args.bench_small_m):
+    if not (args.hadamard or args.planar or args.fused or args.fused_prefill or args.bench or args.bench_small_m):
         parser.error("pass --hadamard, --planar, --fused, --bench and/or --bench-small-m")
     if args.out and not (args.bench or args.bench_small_m):
         parser.error("--out needs --bench or --bench-small-m")
-    for flag, fn in ((args.hadamard, check_hadamard), (args.planar, check_planar), (args.fused, check_fused)):
+    for flag, fn in ((args.hadamard, check_hadamard), (args.planar, check_planar), (args.fused, check_fused),
+                     (args.fused_prefill, check_fused_prefill)):
         if flag and fn() == 2:
             return 2
     if args.bench or args.bench_small_m:
