@@ -265,9 +265,11 @@ static __device__ __forceinline__ int swz(const int r, const int c) {
     return r * 128 + ((c ^ (r & 7)) << 4);
 }
 
-template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int A_STAGES_>
+template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int A_STAGES_, bool PREFETCH_ = true>
 struct Config {
     static constexpr int BM = BM_, BN = BN_, WARPS_M = WARPS_M_, WARPS_N = WARPS_N_, A_STAGES = A_STAGES_;
+    // load the next sub-block's fragments during the current one (more registers)
+    static constexpr bool PREFETCH = PREFETCH_;
     static constexpr int NWARPS = WARPS_M * WARPS_N;
     static constexpr int NT = NWARPS * 32;
     static constexpr int WM = BM / WARPS_M;
@@ -524,12 +526,17 @@ static __global__ void __launch_bounds__(Cfg::NT, 1)
                 bf[slot][2 * jp + 1][1] = tmp[3];
             }
         };
-        load_frags(0, 0);
-#pragma unroll
+        if (Cfg::PREFETCH) {
+            load_frags(0, 0);
+        }
+        constexpr int kSUnroll = Cfg::PREFETCH ? 4 : 1;
+#pragma unroll kSUnroll
         for (int s = 0; s < 4; ++s) {
-            const int cur = s & 1;
-            if (s < 3) {
+            const int cur = Cfg::PREFETCH ? (s & 1) : 0;
+            if (Cfg::PREFETCH && s < 3) {
                 load_frags(s + 1, cur ^ 1);
+            } else if (!Cfg::PREFETCH) {
+                load_frags(s, 0);
             }
             // dx and -1.5*2^23*dx: both exact in fp32 (11 + 2 significant bits)
             float2 dxv[MT][2];
@@ -588,29 +595,30 @@ static __global__ void __launch_bounds__(Cfg::NT, 1)
 }
 
 // Variants for the bench / dispatch (BM, BN, warps M x N, A stages):
-//   0: 128 x 128, 2 x 4 warps (64 x 32 warp tile), 2 stages
-//   1: 128 x 128, 4 x 4 warps (32 x 32), 2 stages
-//   2: 128 x 128, 4 x 2 warps (32 x 64), 2 stages
-//   3: 64 x 128, 2 x 4 warps (32 x 32), 3 stages
-//   4: 64 x 128, 1 x 4 warps (64 x 32), 3 stages
+//   0: 128 x 128, 2 x 4 warps (64 x 32 warp tile), 2 stages, fragment prefetch
+//   1: as 0 without the fragment prefetch
+//   2: 128 x 128, 4 x 2 warps (32 x 64), 2 stages, prefetch
+//   3: 64 x 128, 2 x 4 warps (32 x 32), 3 stages, prefetch (small M)
+//   4: 128 x 128, 4 x 4 warps (32 x 32), 2 stages, no prefetch (16 warps)
 using Cfg0 = Config<128, 128, 2, 4, 2>;
-using Cfg1 = Config<128, 128, 4, 4, 2>;
+using Cfg1 = Config<128, 128, 2, 4, 2, false>;
 using Cfg2 = Config<128, 128, 4, 2, 2>;
 using Cfg3 = Config<64, 128, 2, 4, 3>;
-using Cfg4 = Config<64, 128, 1, 4, 3>;
+using Cfg4 = Config<128, 128, 4, 4, 2, false>;
 #define PTQ1_0_MMA_NUM_VARIANTS 5
 
 static inline int variant_bn(const int variant) { (void) variant; return 128; }
 
 // Default tile choice (measured on L40S and L4, Bonsai shapes): the 64-row tile (3) up to 64 rows
 // and whenever the 128 x 128 grid would leave more than half the SMs idle (K = 17408 / N = 5120
-// at small M); the 128 x 128 tile with 64 x 32 warp tiles (0) otherwise.
+// at small M); otherwise the 128 x 128 tile with 64 x 32 warp tiles without the fragment prefetch
+// (1: 178 registers, ~5 % faster than the prefetching 0 on the L40S).
 static inline int choose_variant(const int M, const int N, const int sms) {
     if (M <= 64) {
         return 3;
     }
     const long ctas = (long) ((M + 127) / 128) * (N / 128);
-    return 2 * ctas < sms ? 3 : 0;
+    return 2 * ctas < sms ? 3 : 1;
 }
 
 template <typename out_t, typename Cfg>
