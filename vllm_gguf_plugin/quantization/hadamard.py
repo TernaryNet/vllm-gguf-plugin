@@ -50,11 +50,16 @@ HADAMARD_COMPUTE_DTYPE = torch.float32
 _LAYOUT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
-#: ``VLLM_GGUF_HADACORE`` selects how the blockwise rotation runs on CUDA for
-#: bf16 / fp16 activations: ``auto`` (default) uses vLLM's Hadacore FWHT kernel
-#: when the vLLM build has it and the dense ``x @ H`` GEMM otherwise, ``1``
-#: requires Hadacore (refuses to prepare without it), ``0`` forces the dense
-#: GEMM. fp32 activations and CPU tensors always take the dense path.
+#: ``VLLM_GGUF_HADACORE`` selects how this layout's rotation runs on CUDA for
+#: bf16 / fp16 activations: ``0`` (default) the dense ``x @ H`` GEMM, ``auto``
+#: vLLM's Hadacore FWHT kernel when the vLLM build has it, ``1`` Hadacore or
+#: refuse. fp32 activations and CPU tensors always take the dense path. The
+#: decode hot path does not come here: the folded PTQ1_0 linears at 1-8 rows run
+#: the fused sign + FWHT + Q8 kernel (``VLLM_GGUF_FUSED_ROT``, linear.py), which
+#: reproduces the dense rotation's values. Hadacore rounds to bf16 after each of
+#: its three stages (rotation ~1 bf16 ulp off the dense one; folded-linear
+#: outputs relL2 6.4-6.9e-3 apart on an L40S), so it is opt-in: measured -1.79 ms
+#: a step at 1 stream without the fused op, nothing measurable with it.
 HADACORE_ENV = "VLLM_GGUF_HADACORE"
 #: Largest transform the Hadacore kernel implements.
 _HADACORE_MAX_BLOCK = 1 << 15
@@ -65,7 +70,7 @@ _HADACORE_LOGGED: set[str] = set()
 def _hadacore_mode() -> str:
     import os
 
-    mode = os.environ.get(HADACORE_ENV, "auto").strip().lower()
+    mode = os.environ.get(HADACORE_ENV, "0").strip().lower()
     if mode not in ("auto", "0", "1"):
         raise ValueError(f"{HADACORE_ENV} must be auto, 0 or 1, got {mode!r}")
     return mode
