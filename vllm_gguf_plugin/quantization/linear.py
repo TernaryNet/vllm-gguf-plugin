@@ -221,29 +221,42 @@ except AttributeError as error:
     raise error
 
 #: ``VLLM_GGUF_FUSED_ROT``: ``1`` runs Hadamard-folded PTQ1_0 linears at 1-8
-#: rows through one kernel that applies the signs, the 1024-point FWHT (fp32)
-#: and the Q8 quantize before the mat-vec (``ggml_mul_mat_vec_ptq1_0_rot``);
-#: ``0`` (default) keeps the separate rotation + quantize. Needs Hadacore for
-#: the rows above 8, which take the rotation + regular tiers inside the op.
+#: rows through one kernel that applies the signs, the 1024-point FWHT (fp32,
+#: rounded once to the activation dtype) and the Q8 quantize before the
+#: mat-vec (``ggml_mul_mat_vec_ptq1_0_rot``) -- the same activation values the
+#: dense ``x @ H`` path produces, without its GEMM and quantize launches. Rows
+#: above 8 (prefill) take the dense rotation and the regular tiers inside the
+#: op, so they match the unfused path too. ``0`` (default) keeps the separate
+#: rotation (Hadacore or dense, ``VLLM_GGUF_HADACORE``) + quantize.
 FUSED_ROT_ENV = "VLLM_GGUF_FUSED_ROT"
 
 
 def _fused_rot_mul_mat_gguf(
-    x: torch.Tensor, weight: torch.Tensor, weight_type: int, signs: torch.Tensor
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_type: int,
+    signs_f32: torch.Tensor,
+    signs: torch.Tensor,
+    matrix: torch.Tensor,
 ) -> torch.Tensor:
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if x.shape[0] <= _PRISM_MMV_MAX_ROWS:
         return ops.ggml_mul_mat_vec_ptq1_0_rot(
-            weight, x.contiguous(), signs, weight.shape[0], weight_type == PTQ1_0_PLANAR
+            weight, x.contiguous(), signs_f32, weight.shape[0], weight_type == PTQ1_0_PLANAR
         )
-    rotated = (x * signs.to(x.dtype)).reshape(-1, 1024)
-    rotated = torch.ops._C.hadacore_transform(rotated, False).reshape(x.shape)
+    block = matrix.shape[0]
+    rotated = ((x * signs).reshape(-1, block) @ matrix).reshape(x.shape)
     return _fused_mul_mat_gguf(rotated, weight, weight_type)
 
 
 def _fused_rot_mul_mat_gguf_fake(
-    x: torch.Tensor, weight: torch.Tensor, weight_type: int, signs: torch.Tensor
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_type: int,
+    signs_f32: torch.Tensor,
+    signs: torch.Tensor,
+    matrix: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
 
@@ -353,10 +366,8 @@ class GGUFLinearMethod(LinearMethodBase):
             self.layout.prepare(layer.weight.device)
         self._fused_rot = self._resolve_fused_rotation(layer)
 
-    def _resolve_fused_rotation(
-        self, layer: torch.nn.Module
-    ) -> tuple[torch.Tensor, int] | None:
-        """(fp32 signs, weight type) for the fused rotate + quantize mat-vec, or None."""
+    def _resolve_fused_rotation(self, layer: torch.nn.Module) -> tuple | None:
+        """(Hadamard layout, weight type) for the fused rotate + quantize mat-vec, or None."""
         import os
 
         from .hadamard import GGUFHadamardLayout
@@ -374,14 +385,13 @@ class GGUFLinearMethod(LinearMethodBase):
             ops.fused_rot_available()
             and layout.forward
             and layout.block_size == 1024
-            and layout._hadacore is not None
             and torch.float32 in layout._signs
             and len(types) == 1
             and types <= {int(WeightType.PTQ1_0), PTQ1_0_PLANAR}
         )
         if not usable:
             return None
-        return layout._signs[torch.float32], next(iter(types))
+        return layout, next(iter(types))
 
     def _maybe_repack_ptq1_0_planar(self, layer: torch.nn.Module) -> None:
         mode = _ptq1_0_planar_mode()
@@ -493,12 +503,20 @@ class GGUFLinearMethod(LinearMethodBase):
         if (
             fused is not None
             and x.dim() == 2
-            and x.shape[-1] == fused[0].shape[0]
+            and x.shape[-1] == fused[0].width
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
-            # signs + FWHT + Q8 quantize + mat-vec in the op (1-8 rows)
-            signs, weight_type = fused
-            out = torch.ops.vllm._fused_rot_mul_mat_gguf(x, layer.weight, weight_type, signs)
+            # signs + FWHT + Q8 quantize + mat-vec in the op (1-8 rows); the
+            # dense rotation + regular tiers above 8 rows
+            layout, weight_type = fused
+            out = torch.ops.vllm._fused_rot_mul_mat_gguf(
+                x,
+                layer.weight,
+                weight_type,
+                layout._signs[torch.float32],
+                layout._signs[x.dtype],
+                layout._matrices[x.dtype],
+            )
             if bias is not None:
                 out.add_(bias)
             return out

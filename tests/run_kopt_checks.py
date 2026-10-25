@@ -86,10 +86,13 @@ def random_signs(width, seed):
 def layouts(width, seed, forward=True, inverse=False):
     """(hadacore layout, dense layout) over the same signs."""
     signs = random_signs(width, seed)
+    # the exact device of the inputs (cuda:N): _apply re-prepares -- and so
+    # re-resolves Hadacore -- on any device mismatch, "cuda" vs "cuda:0" included
+    device = torch.device("cuda", torch.cuda.current_device())
     hc = hadamard.GGUFHadamardLayout(1024, width, signs, forward=forward, inverse=inverse)
-    hc.prepare("cuda")
+    hc.prepare(device)
     dense = hadamard.GGUFHadamardLayout(1024, width, signs, forward=forward, inverse=inverse)
-    dense.prepare("cuda")
+    dense.prepare(device)
     dense._hadacore = None
     return hc, dense, torch.tensor(signs, dtype=torch.float64, device="cuda")
 
@@ -117,7 +120,7 @@ def check_hadamard():
     for dtype in (torch.bfloat16, torch.float16):
         for width in FOLDED_WIDTHS:
             hc, dense, signs = layouts(width, seed=width)
-            assert hc._hadacore is not None
+            assert hc._hadacore is not None and dense._hadacore is None
             for m in (1, 2, 4, 8, 64, 2048):
                 x = torch.randn((m, width), dtype=dtype, device="cuda")
                 a = hc.input_to_gguf(x).float()
@@ -146,7 +149,7 @@ def check_hadamard():
     x = torch.randn((2, 5120), dtype=torch.bfloat16, device="cuda")
     keep = x.clone()
     nosign = hadamard.GGUFHadamardLayout(1024, 5120, None, forward=True, inverse=False)
-    nosign.prepare("cuda")
+    nosign.prepare(torch.device("cuda", torch.cuda.current_device()))
     nosign.input_to_gguf(x)
     expect("input untouched (identity signs)", torch.equal(x, keep))
     # rotate + PTQ1_0 mat-vec end to end, vs the dense-rotation path and fp64
@@ -240,7 +243,7 @@ def check_planar():
     torch.cuda.synchronize()
     expect("planar mat-vec CUDA graph replay == eager", torch.equal(captured, eager))
     # refusals: no silent zeros from the generic kernels
-    for name, fn in (("generic mmvq", lambda: ops.ggml_mul_mat_vec_a8(w, x, PLANAR, 1000)),
+    for name, fn in (("generic mmvq", lambda: torch.ops._C_gguf.ggml_mul_mat_vec_a8(w, x, PLANAR, 1000)),
                      ("generic dequant", lambda: torch.ops._C_gguf.ggml_dequantize(w, PLANAR, 1000, 5120, None))):
         try:
             fn()
@@ -277,6 +280,14 @@ def check_fused():
                        f"relL2 fused vs dense-rotation path {rel:.2e}; vs fp64: fused "
                        f"{((fused - yr).norm() / yr.norm()).item():.2e} dense {((yd - yr).norm() / yr.norm()).item():.2e} "
                        f"hadacore {((yh - yr).norm() / yr.norm()).item():.2e}")
+        # the op as the linear method calls it: fused at <= 8 rows, dense rotation above
+        for n in (1, 8, 9, 64):
+            x = torch.randn((n, width), dtype=torch.bfloat16, device="cuda")
+            op = linear._fused_rot_mul_mat_gguf(x, w, PTQ, sg, dense._signs[torch.bfloat16],
+                                                dense._matrices[torch.bfloat16])
+            yd = linear._fused_mul_mat_gguf(dense.input_to_gguf(x), w, PTQ)
+            expect(f"fused op width={width} n={n} == dense-rotation path", torch.equal(op, yd),
+                   f"max|diff|={(op.float() - yd.float()).abs().max().item():.3g}")
     return 0
 
 
