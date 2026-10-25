@@ -24,12 +24,15 @@ Switches (read once per process, at model construction):
 * ``VLLM_GGUF_TP_ROW``: ``auto`` (default) uses gather mode only where the
   per-rank input is not whole Hadamard blocks; ``gather`` uses it for every
   folded row-parallel layer (bit-exact A/Bs against TP 1).
-* ``VLLM_GGUF_TP_OUT``: ``ag`` (default) all-gathers the ``N / TP`` output rows
-  and clears the layer's ``reduce_results``; ``ar`` returns the zero-padded
-  partial sum to the layer's all-reduce instead (layers with a bias, or built
-  with ``reduce_results=False``, always use ``ar``). Same values either way; on
-  4x L4 over PCIe (NCCL via SHM) the all-gather is the cheaper collective:
-  Bonsai-27B TP 4 spec-off step 17.7 -> 16.6 ms.
+* ``VLLM_GGUF_TP_OUT``: ``ar`` (default) returns the zero-padded partial sum to
+  the layer's all-reduce; ``ag`` (EXPERIMENTAL) all-gathers the ``N / TP``
+  output rows instead and clears the layer's ``reduce_results`` (layers with a
+  bias, or built with ``reduce_results=False``, always use ``ar``). On 4x L4
+  over PCIe the all-gather is the cheaper collective (Bonsai-27B TP 4 spec-off
+  step 17.7 -> 16.6 ms, replies sane), but with MTP speculative decoding and
+  four concurrent streams ``ag`` produced a garbage reply and a non-finite
+  logprob (HTTP 400) on 2026-10-25 while ``ar`` did not: do not enable it until
+  that is understood.
 """
 
 from __future__ import annotations
@@ -61,7 +64,7 @@ def tp_row_mode() -> str:
 
 
 def tp_out_mode() -> str:
-    mode = os.environ.get(TP_OUT_ENV, "ag").strip().lower()
+    mode = os.environ.get(TP_OUT_ENV, "ar").strip().lower()
     if mode not in ("ar", "ag"):
         raise ValueError(f"{TP_OUT_ENV} must be ar or ag, got {mode!r}")
     return mode
@@ -138,7 +141,7 @@ class GGUFTPGatherLinearMethod(GGUFLinearMethod):
         *,
         tp_rank: int,
         tp_size: int,
-        out_mode: str = "ag",
+        out_mode: str = "ar",
     ) -> None:
         super().__init__(quant_config, layout=layout)
         if not 0 <= tp_rank < tp_size:
