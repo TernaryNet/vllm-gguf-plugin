@@ -140,3 +140,28 @@ def test_ptq1_0_mmv_multi_column(num_tokens: int, hidden_size: int, dtype: torch
         torch.bfloat16: (0.1, 1.6e-2),
     }[dtype]
     torch.testing.assert_close(out, mmvq, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("num_tokens", [16, 64, 257, 300, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 5120])
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_ptq1_0_mma_matches_triton_tier(num_tokens: int, hidden_size: int, dtype: torch.dtype):
+    """The int8 tensor-core GEMM reproduces the Triton tier bit for bit (same Q8 activations,
+    exact int32 sub-block dots, the same fp32 fma sequence and output rounding)."""
+    if not ops.ptq1_0_mma_available():
+        pytest.skip("CUDA extension without ggml_mul_mat_ptq1_0_mma")
+    seed_everything(0)
+    packed, dense = _packed(_ternary_weight(256, hidden_size))
+    x = torch.rand((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    tri = ggml_mul_mat_a8_triton(packed, x, QUANT_TYPE, 256)
+    from vllm_gguf_plugin.quantization.linear import repack_ptq1_0_planar
+
+    planar = repack_ptq1_0_planar(packed.clone())
+    for variant in (-1, 1, 3):
+        out = ops.ggml_mul_mat_ptq1_0_mma(packed, x, 256, variant)
+        torch.testing.assert_close(out, tri, atol=0, rtol=0)
+        out = ops.ggml_mul_mat_ptq1_0_mma(planar, x, 256, variant, True)
+        torch.testing.assert_close(out, tri, atol=0, rtol=0)
+    # (the Triton tier against a dense reference is test_ptq1_0_gemm_triton's job)
+    del dense

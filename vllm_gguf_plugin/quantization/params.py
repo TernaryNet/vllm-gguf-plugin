@@ -239,7 +239,20 @@ class _GGUFParamLoadMixin:
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         layout = getattr(self, "gguf_layout", None)
-        if tp_size > 1 and layout is not None:
+        if tp_size > 1 and getattr(self, "gguf_tp_gather", False):
+            # Gather mode (quantization/tp.py): this rank keeps N / TP output
+            # rows over the full input, so whole packed rows are narrowed and
+            # no Hadamard block is ever split.
+            rows, remainder = divmod(loaded_weight.shape[self.output_dim], tp_size)
+            if remainder:
+                raise ValueError(
+                    f"{loaded_weight.shape[self.output_dim]} output rows of a "
+                    f"gather-mode weight do not divide across TP size {tp_size}"
+                )
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, tp_rank * rows, rows
+            )
+        elif tp_size > 1 and layout is not None:
             weight_type_param = self.gguf_weight_type_parameter
             weight_type = weight_type_param.weight_type
             if weight_type not in gguf.GGML_QUANT_SIZES:

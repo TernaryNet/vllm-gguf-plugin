@@ -7,6 +7,8 @@ from types import MappingProxyType
 from gguf import GGMLQuantizationType as WeightType
 from vllm.logger import init_logger
 
+from ..ggml_ext import GGML_TYPE_PTQ1_0_PLANAR
+
 logger = init_logger(__name__)
 
 
@@ -74,6 +76,10 @@ IMATRIX_QUANT_TYPES = {
 # dequantize and MMVQ kernels; PQ2_0 is only registered so files using it are
 # rejected with a clear error.
 PRISM_TERNARY_TYPES = {WeightType.PTQ1_0}
+#: Planar PTQ1_0 (internal type id, see ``ggml_ext.GGML_TYPE_PTQ1_0_PLANAR``)
+#: and its (elements, bytes) per block, as in ``gguf.GGML_QUANT_SIZES``.
+PTQ1_0_PLANAR = GGML_TYPE_PTQ1_0_PLANAR
+PTQ1_0_PLANAR_SIZES = (128, 28)
 DEQUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | PRISM_TERNARY_TYPES
 )

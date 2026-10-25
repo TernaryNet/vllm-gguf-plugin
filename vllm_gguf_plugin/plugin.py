@@ -141,8 +141,37 @@ def _register_omni_diffusion_quantization() -> None:
     register_quantization_override("gguf", lambda **kw: DiffusionGGUFConfig(**kw))
 
 
+#: Plugin switches that change the traced forward: which rotation op runs, the
+#: weight-type constants the graph bakes into its custom-op calls (planar
+#: PTQ1_0 is a different id), whether the fused rotate + quantize op is used.
+#: vLLM keys its torch.compile cache on its own registered env vars only
+#: (``vllm.envs.compile_factors``), so flipping one of these on a warm cache
+#: would load a graph compiled for the other setting. Registering them as
+#: vLLM env vars puts them in the cache key.
+COMPILE_AFFECTING_ENVS = (
+    "VLLM_GGUF_USE_CUDA",
+    "VLLM_GGUF_HADACORE",
+    "VLLM_GGUF_PTQ1_0_PLANAR",
+    "VLLM_GGUF_FUSED_ROT",
+    "VLLM_GGUF_SMALL_M_GEMV",
+    "VLLM_GGUF_SMALL_M_NARROW_8",
+    "VLLM_GGUF_TP_ROW",
+    "VLLM_GGUF_TP_OUT",
+)
+
+
+def _register_compile_cache_factors() -> None:
+    import os
+
+    from vllm import envs
+
+    for name in COMPILE_AFFECTING_ENVS:
+        envs.environment_variables.setdefault(name, lambda name=name: os.getenv(name, ""))
+
+
 def register() -> None:
     """Register the out-of-tree GGUF integration."""
+    _register_compile_cache_factors()
     register_quantization_config("gguf")(GGUFConfig)
     _register_omni_diffusion_quantization()
 

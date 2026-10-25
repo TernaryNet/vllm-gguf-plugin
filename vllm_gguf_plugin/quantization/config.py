@@ -6,10 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.linear import (
-    LinearBase,
-    UnquantizedLinearMethod,
-)
+from vllm.model_executor.layers.linear import LinearBase, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -72,18 +69,23 @@ class GGUFConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         from .fused_moe import GGUFMoEMethod
-        from .linear import GGUFLinearMethod
+        from .linear import GGUFLinearMethod, GGUFUnquantizedLinearMethod
+        from .tp import gather_method_for
         from .vocal_embeds import GGUFEmbeddingMethod
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
-                return UnquantizedLinearMethod()
-            return GGUFLinearMethod(
-                self,
-                layout=self.resolve_linear_layout(prefix),
-            )
+                return GGUFUnquantizedLinearMethod()
+            layout = self.resolve_linear_layout(prefix)
+            if isinstance(layer, RowParallelLinear):
+                # Hadamard-folded inputs that do not split into whole blocks
+                # per rank run column-parallel over the outputs (see tp.py).
+                gather_method = gather_method_for(self, layer, layout)
+                if gather_method is not None:
+                    return gather_method
+            return GGUFLinearMethod(self, layout=layout)
         if isinstance(layer, VocabParallelEmbedding):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping

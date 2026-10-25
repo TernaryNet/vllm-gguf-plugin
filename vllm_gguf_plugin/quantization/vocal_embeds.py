@@ -25,7 +25,12 @@ from .params import (
     _materialize_gguf_weight_parameter,
     _materialize_gguf_weight_type_parameter,
 )
-from .utils import DEQUANT_TYPES, UNQUANTIZED_TYPES
+from .utils import (
+    DEQUANT_TYPES,
+    PTQ1_0_PLANAR,
+    PTQ1_0_PLANAR_SIZES,
+    UNQUANTIZED_TYPES,
+)
 
 
 def recursive_replace_vocab_modules(
@@ -85,8 +90,13 @@ def _apply_gguf_embedding(
 ) -> torch.Tensor:
     if weight_type in UNQUANTIZED_TYPES:
         return torch.embedding(weight, x)
-    if weight_type in DEQUANT_TYPES:
-        block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+    if weight_type in DEQUANT_TYPES or weight_type == PTQ1_0_PLANAR:
+        # planar PTQ1_0 rows are self-contained, so gathering them works as is
+        block_size, type_size = (
+            PTQ1_0_PLANAR_SIZES
+            if weight_type == PTQ1_0_PLANAR
+            else gguf.GGML_QUANT_SIZES[weight_type]
+        )
         x_flat = x.flatten()
         assert hidden_size == weight.shape[1] // type_size * block_size
         quant = torch.index_select(weight, dim=0, index=x_flat)

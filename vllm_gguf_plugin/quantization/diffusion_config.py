@@ -33,6 +33,9 @@ def dequant_gemm_gguf(
 class DiffusionGGUFLinearMethod(GGUFLinearMethod):
     """GGUF linear method using dequant+GEMM for N-D diffusion tensors."""
 
+    # dequant_gemm_gguf reads GGML block order with GGML block sizes
+    ptq1_0_planar_repack = False
+
     def apply(
         self,
         layer: torch.nn.Module,
