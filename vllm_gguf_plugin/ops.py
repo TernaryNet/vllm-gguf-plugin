@@ -142,6 +142,17 @@ if (
     ) -> torch.Tensor:
         return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
 
+    if hasattr(torch.ops._C_gguf, "ggml_mul_mat_ptq1_0_mma"):
+
+        @register_fake("_C_gguf::ggml_mul_mat_ptq1_0_mma")
+        def _ggml_mul_mat_ptq1_0_mma_fake(
+            W: torch.Tensor,
+            X: torch.Tensor,
+            row: torch.SymInt,
+            variant: int,
+        ) -> torch.Tensor:
+            return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
+
     @register_fake("_C_gguf::ggml_mul_mat_a8")
     def _ggml_mul_mat_a8_fake(
         W: torch.Tensor,
@@ -218,6 +229,21 @@ def ptq1_0_mmv_available() -> bool:
 def ggml_mul_mat_vec_ptq1_0(W: torch.Tensor, X: torch.Tensor, row: int) -> torch.Tensor:
     """PTQ1_0 mat-vec that decodes each weight block once for up to 8 rows of X."""
     return torch.ops._C_gguf.ggml_mul_mat_vec_ptq1_0(W, X, row)
+
+
+def ptq1_0_mma_available() -> bool:
+    return _cuda_kernel_available("ggml_mul_mat_ptq1_0_mma")
+
+
+def ggml_mul_mat_ptq1_0_mma(
+    W: torch.Tensor, X: torch.Tensor, row: int, variant: int = -1
+) -> torch.Tensor:
+    """PTQ1_0 GEMM on int8 tensor cores (prefill sizes); bit-identical to the Triton tier.
+
+    ``X`` must be contiguous with ``K % 512 == 0``; ``row`` a multiple of the N tile
+    (128, or 256 for variant 4). ``variant`` picks the tile configuration (-1 = default).
+    """
+    return torch.ops._C_gguf.ggml_mul_mat_ptq1_0_mma(W, X, row, variant)
 
 
 def ggml_mul_mat_a8(
