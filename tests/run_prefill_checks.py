@@ -34,6 +34,9 @@ SHAPES = {
     "out": (5120, 6144),
 }
 VARIANTS = [0, 1, 2, 3, 4]
+# + 16: one activation scale per 128 elements (not the Triton tier's numerics; error compared
+# against the float64 reference instead of equality)
+SB128_VARIANTS = [16, 17, 18, 19, 20]
 
 
 def random_ptq1_0(n, k, seed=0, device="cuda"):
@@ -49,7 +52,7 @@ def random_ptq1_0(n, k, seed=0, device="cuda"):
 
 
 def variant_fits(variant, n):
-    return n % (256 if variant == 4 else 128) == 0
+    return n % (256 if variant % 16 == 4 else 128) == 0
 
 
 def check(args, report):
@@ -77,11 +80,11 @@ def check(args, report):
                 ref = x.double() @ dense64.T
                 scale = ref.abs().max().item()
                 err_tri = (tri.double() - ref).abs().max().item() / scale
-                for v in VARIANTS:
+                for v in args.variants:
                     if not variant_fits(v, n):
                         continue
                     out = ops.ggml_mul_mat_ptq1_0_mma(w, x, n, v)
-                    equal = torch.equal(out, tri)
+                    equal = torch.equal(out, tri) if v < 16 else None
                     nbad = int((out != tri).sum().item())
                     err = (out.double() - ref).abs().max().item() / scale
                     row = {
@@ -90,9 +93,12 @@ def check(args, report):
                         "max_rel_err_vs_f64": err, "triton_max_rel_err_vs_f64": err_tri,
                     }
                     rows.append(row)
-                    if not equal:
+                    if v < 16 and not equal:
                         fails += 1
                         print(f"MISMATCH {row}", flush=True)
+                    if v >= 16 and err > 3 * err_tri + 1e-6:
+                        fails += 1
+                        print(f"SB128 ERROR TOO LARGE {row}", flush=True)
         print(f"check n={n} k={k}: done ({fails} failing so far)", flush=True)
     # the dispatcher at 300 rows takes the mma tier and matches the Triton tier
     w = random_ptq1_0(512, 5120, seed=7)
@@ -101,12 +107,18 @@ def check(args, report):
     disp_equal = torch.equal(disp, ggml_gemm_ptq1_0_triton(w, x, 512))
     print(f"dispatcher 300 rows equal to Triton tier: {disp_equal}")
     fails += 0 if disp_equal else 1
-    worst = max(r["max_rel_err_vs_f64"] for r in rows)
+    worst = max((r["max_rel_err_vs_f64"] for r in rows if r["variant"] < 16), default=0.0)
+    worst_128 = max((r["max_rel_err_vs_f64"] for r in rows if r["variant"] >= 16), default=0.0)
     worst_tri = max(r["triton_max_rel_err_vs_f64"] for r in rows)
+    ratios = [r["max_rel_err_vs_f64"] / r["triton_max_rel_err_vs_f64"] for r in rows if r["variant"] >= 16]
+    if ratios:
+        ratios.sort()
+        print(f"SB128 error / Triton-tier error: median {ratios[len(ratios) // 2]:.2f}, max {ratios[-1]:.2f}")
     print(
         f"CHECK {'PASS' if fails == 0 else 'FAIL'}: {len(rows)} kernel cases, "
-        f"{sum(r['equal_triton'] for r in rows)} bit-identical to the Triton tier; "
-        f"max rel err vs float64: mma {worst:.3e}, Triton {worst_tri:.3e}"
+        f"{sum(bool(r['equal_triton']) for r in rows)} of {sum(r['variant'] < 16 for r in rows)} per-32 cases "
+        f"bit-identical to the Triton tier; max rel err vs float64: mma {worst:.3e}, per-128 {worst_128:.3e}, "
+        f"Triton {worst_tri:.3e}"
     )
     report["check"] = {"fails": fails, "rows": rows, "dispatcher_equal": disp_equal}
     return fails == 0
@@ -141,8 +153,9 @@ def bench(args, report):
     names = args.shapes.split(",")
     ms = [int(v) for v in args.rows.split(",")]
     print(f"device {torch.cuda.get_device_name(0)}, L2 {l2 >> 20} MB")
-    print("| shape | M | dequant+cuBLAS ms | Triton ms | " + " | ".join(f"mma v{v} ms" for v in VARIANTS) + " | best mma TOPS | best/old |")
-    print("|---|---|---|---|" + "---|" * len(VARIANTS) + "---|---|")
+    variants = args.variants
+    print("| shape | M | dequant+cuBLAS ms | Triton ms | " + " | ".join(f"mma v{v} ms" for v in variants) + " | best v32 TOPS | best v32/old | best v128/old |")
+    print("|---|---|---|---|" + "---|" * len(variants) + "---|---|---|")
     for name in names:
         n, k = SHAPES[name]
         base = random_ptq1_0(n, k, seed=1)
@@ -160,22 +173,27 @@ def bench(args, report):
                 return ggml_gemm_ptq1_0_triton(w, x, n)
 
             row = {"shape": name, "n": n, "k": k, "m": m}
-            row["old_ms"] = bench_ms(old, weights, iters)
-            row["triton_ms"] = bench_ms(tri, weights, iters) if m <= 512 else None
-            for v in VARIANTS:
+            row["old_ms"] = bench_ms(old, weights, iters) if not args.no_old else float("nan")
+            row["triton_ms"] = bench_ms(tri, weights, iters) if m <= 512 and not args.no_old else None
+            for v in variants:
                 if variant_fits(v, n):
                     row[f"mma{v}_ms"] = bench_ms(
                         lambda w, v=v: ops.ggml_mul_mat_ptq1_0_mma(w, x, n, v),
                         weights,
                         iters,
                     )
-            best = min(row[f"mma{v}_ms"] for v in VARIANTS if f"mma{v}_ms" in row)
+            t32 = [row[f"mma{v}_ms"] for v in variants if v < 16 and f"mma{v}_ms" in row]
+            t128 = [row[f"mma{v}_ms"] for v in variants if v >= 16 and f"mma{v}_ms" in row]
+            best = min(t32) if t32 else float("nan")
+            best128 = min(t128) if t128 else float("nan")
             row["best_mma_tops"] = 2 * m * n * k / (best * 1e-3) / 1e12
             row["best_over_old"] = best / row["old_ms"]
+            row["best128_over_old"] = best128 / row["old_ms"]
+            row["best128_tops"] = 2 * m * n * k / (best128 * 1e-3) / 1e12
             results.append(row)
             cells = [f"{row['old_ms']:.3f}", "-" if row["triton_ms"] is None else f"{row['triton_ms']:.3f}"]
-            cells += [f"{row[f'mma{v}_ms']:.3f}" if f"mma{v}_ms" in row else "-" for v in VARIANTS]
-            print(f"| {name} | {m} | " + " | ".join(cells) + f" | {row['best_mma_tops']:.0f} | {row['best_over_old']:.2f} |", flush=True)
+            cells += [f"{row[f'mma{v}_ms']:.3f}" if f"mma{v}_ms" in row else "-" for v in variants]
+            print(f"| {name} | {m} | " + " | ".join(cells) + f" | {row['best_mma_tops']:.0f} | {row['best_over_old']:.2f} | {row['best128_over_old']:.2f} |", flush=True)
         del weights, base
         torch.cuda.empty_cache()
     report["bench"] = results
@@ -187,8 +205,11 @@ def main():
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--shapes", default="gate_up,qkvz,down,out")
     parser.add_argument("--rows", default="128,256,257,512,1024,2048")
+    parser.add_argument("--variants", default="0,1,2,3,4")
+    parser.add_argument("--no-old", action="store_true", help="skip the dequant + cuBLAS and Triton timings")
     parser.add_argument("--json")
     args = parser.parse_args()
+    args.variants = [int(v) for v in args.variants.split(",")]
     if not ops.ptq1_0_mma_available():
         print("REFUSED: ggml_mul_mat_ptq1_0_mma not in this build", file=sys.stderr)
         return 2

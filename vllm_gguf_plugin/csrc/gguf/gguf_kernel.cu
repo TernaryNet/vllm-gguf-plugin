@@ -266,8 +266,9 @@ Tensor ggml_mul_mat_ptq1_0_mma(Tensor W,  // quant weight
                   "ggml_mul_mat_ptq1_0_mma: weight row size does not match K");
   STD_TORCH_CHECK(W.sizes()[0] >= row, "ggml_mul_mat_ptq1_0_mma: weight has fewer rows than row");
   const int v = variant < 0 ? 0 : (int)variant;
-  STD_TORCH_CHECK(v < PTQ1_0_MMA_NUM_VARIANTS, "ggml_mul_mat_ptq1_0_mma: unknown variant");
-  STD_TORCH_CHECK(row % ptq1_0_mma::variant_bn(v) == 0,
+  STD_TORCH_CHECK((v & 255) < PTQ1_0_MMA_NUM_VARIANTS, "ggml_mul_mat_ptq1_0_mma: unknown variant");
+  const int group = ptq1_0_mma::variant_group(v);
+  STD_TORCH_CHECK(row % ptq1_0_mma::variant_bn(v & 255) == 0,
                   "ggml_mul_mat_ptq1_0_mma: row must be a multiple of the N tile");
   STD_TORCH_CHECK(X.is_contiguous(), "ggml_mul_mat_ptq1_0_mma: X must be contiguous");
   const int32_t device_idx = X.get_device_index();
@@ -278,11 +279,11 @@ Tensor ggml_mul_mat_ptq1_0_mma(Tensor W,  // quant weight
     return Y;
   }
   Tensor quant_X = torch::stable::new_empty(W, {vecs, col}, ScalarType::Char);
-  Tensor scale_X = torch::stable::new_empty(W, {vecs, col / 32}, ScalarType::Half);
+  Tensor scale_X = torch::stable::new_empty(W, {vecs, col / group}, ScalarType::Half);
   VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_ptq1_0_mma", [&] {
-    ptq1_0_mma::quantize_q8_32_cuda<scalar_t>(
+    ptq1_0_mma::quantize_q8_cuda<scalar_t>(
         (const scalar_t*)X.data_ptr(), (int8_t*)quant_X.data_ptr(),
-        (half*)scale_X.data_ptr(), (int)vecs, (int)col, stream);
+        (half*)scale_X.data_ptr(), (int)vecs, (int)col, group, stream);
     ptq1_0_mma::ptq1_0_mma_gemm_cuda<scalar_t>(
         (const int8_t*)quant_X.data_ptr(), (const half*)scale_X.data_ptr(),
         W.data_ptr(), (scalar_t*)Y.data_ptr(), (int)vecs, (int)row, (int)col, v,
