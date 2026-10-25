@@ -256,6 +256,21 @@ static void launch_ptq1_0_planar_lpr(const int variant, const void * vx, const v
   }
 }
 
+// The planar mat-vec for a quantized activation buffer of ncols_q columns
+// (one template argument, so it can be called inside the dispatch macro).
+template <typename scalar_t>
+static void run_ptq1_0_planar(const int64_t ncols_q, const int variant, const void * w, const void * q,
+                              scalar_t * y, const int nb, const int nrows, const int nvecs, const int nblk,
+                              cudaStream_t stream) {
+  switch (ncols_q) {
+    case 1: launch_ptq1_0_planar_lpr<scalar_t, 1>(variant, w, q, y, nb, nrows, nvecs, nblk, stream); break;
+    case 2: launch_ptq1_0_planar_lpr<scalar_t, 2>(variant, w, q, y, nb, nrows, nvecs, nblk, stream); break;
+    case 4: launch_ptq1_0_planar_lpr<scalar_t, 4>(variant, w, q, y, nb, nrows, nvecs, nblk, stream); break;
+    case 8: launch_ptq1_0_planar_lpr<scalar_t, 8>(variant, w, q, y, nb, nrows, nvecs, nblk, stream); break;
+    default: launch_ptq1_0_planar<scalar_t, 16, 32>(w, q, y, nb, nrows, nvecs, nblk, stream); break;
+  }
+}
+
 // Lanes per row when the caller passes 0. Placeholder until the micro-bench
 // on the 27B shapes picks per-shape values (see tests/run_kopt_checks.py).
 static int ptq1_0_planar_auto_lpr(const int nb, const int ncols_q) {
@@ -297,16 +312,8 @@ Tensor ggml_mul_mat_vec_ptq1_0_planar(Tensor W, Tensor X, int64_t row, int64_t l
   VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_vec_ptq1_0_planar", [&] {
     quantize_q8_1_pt_cuda<scalar_t>((scalar_t *) X.data_ptr(), (void *) quant_X.data_ptr(), (int) col, ivecs, nblk,
                                     stream);
-    scalar_t * y = (scalar_t *) Y.data_ptr();
-    const void * w = W.data_ptr();
-    const void * q = quant_X.data_ptr();
-    switch (ncols_q) {
-      case 1: launch_ptq1_0_planar_lpr<scalar_t, 1>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-      case 2: launch_ptq1_0_planar_lpr<scalar_t, 2>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-      case 4: launch_ptq1_0_planar_lpr<scalar_t, 4>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-      case 8: launch_ptq1_0_planar_lpr<scalar_t, 8>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-      default: launch_ptq1_0_planar<scalar_t, 16, 32>(w, q, y, inb, irow, ivecs, nblk, stream); break;
-    }
+    run_ptq1_0_planar<scalar_t>(ncols_q, lpr, W.data_ptr(), quant_X.data_ptr(), (scalar_t *) Y.data_ptr(), inb, irow,
+                                ivecs, nblk, stream);
   });
   return Y;
 }
@@ -363,6 +370,14 @@ static __global__ void dequantize_ptq1_0_planar_kernel(const uint8_t * __restric
   y[i + 1] = convert_from_half<dst_t>(v.y);
 }
 
+template <typename dst_t>
+static void launch_dequantize_ptq1_0_planar(const void * w, dst_t * y, const int nb, const int64_t k,
+                                            cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int64_t blocks = (k / 2 + threads - 1) / threads;
+  dequantize_ptq1_0_planar_kernel<dst_t><<<blocks, threads, 0, stream>>>((const uint8_t *) w, y, nb, k);
+}
+
 // Dequantize a planar PTQ1_0 weight [rows, nb * 28] into the [m, n] output
 // (m * n == rows * nb * 128; the caller's m/n split does not matter, the
 // output is row-major element order either way).
@@ -381,11 +396,8 @@ Tensor ggml_dequantize_ptq1_0_planar(Tensor W, int64_t m, int64_t n, std::option
   if (k == 0) {
     return DW;
   }
-  constexpr int threads = 256;
-  const int64_t blocks = (k / 2 + threads - 1) / threads;
   VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize_ptq1_0_planar", [&] {
-    dequantize_ptq1_0_planar_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-        (const uint8_t *) W.data_ptr(), (scalar_t *) DW.data_ptr(), (int) nb, k);
+    launch_dequantize_ptq1_0_planar<scalar_t>(W.data_ptr(), (scalar_t *) DW.data_ptr(), (int) nb, k, stream);
   });
   return DW;
 }
@@ -515,6 +527,20 @@ rot_quantize_q8_1_pt_kernel(const scalar_t * __restrict__ x, const float * __res
 
 // Y = (H (s * X)) @ W^T for X [vecs <= 16, K], K % 1024 == 0, signs fp32 [K];
 // W in GGML order (planar = false) or the planar layout (planar = true).
+template <typename scalar_t>
+static void run_ptq1_0_rot(const bool planar, const int64_t ncols_q, const int variant, const void * w,
+                           const void * x, const float * signs, void * q, scalar_t * y, const int col,
+                           const int nb, const int nrows, const int nvecs, const int nblk, cudaStream_t stream) {
+  const dim3 qgrid(col / PTQ1_0_ROT_BLOCK, nvecs, 1);
+  rot_quantize_q8_1_pt_kernel<scalar_t><<<qgrid, PTQ1_0_ROT_THREADS, 0, stream>>>(
+      (const scalar_t *) x, signs, (int8_t *) q, col, nblk);
+  if (planar) {
+    run_ptq1_0_planar<scalar_t>(ncols_q, variant, w, q, y, nb, nrows, nvecs, nblk, stream);
+  } else {
+    mul_mat_vec_ptq1_0_pt_cuda<scalar_t>(w, q, y, col, nrows, nvecs, stream);
+  }
+}
+
 Tensor ggml_mul_mat_vec_ptq1_0_rot(Tensor W, Tensor X, Tensor signs, int64_t row, bool planar) {
   const int64_t col = X.sizes()[1];
   const int64_t vecs = X.sizes()[0];
@@ -540,23 +566,8 @@ Tensor ggml_mul_mat_vec_ptq1_0_rot(Tensor W, Tensor X, Tensor signs, int64_t row
   Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
   const int inb = (int) nb, irow = (int) row, ivecs = (int) vecs, icol = (int) col;
   VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_vec_ptq1_0_rot", [&] {
-    const dim3 qgrid(icol / PTQ1_0_ROT_BLOCK, ivecs, 1);
-    rot_quantize_q8_1_pt_kernel<scalar_t><<<qgrid, PTQ1_0_ROT_THREADS, 0, stream>>>(
-        (const scalar_t *) X.data_ptr(), (const float *) signs.data_ptr(), (int8_t *) quant_X.data_ptr(), icol, nblk);
-    scalar_t * y = (scalar_t *) Y.data_ptr();
-    const void * w = W.data_ptr();
-    const void * q = quant_X.data_ptr();
-    if (planar) {
-      switch (ncols_q) {
-        case 1: launch_ptq1_0_planar_lpr<scalar_t, 1>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-        case 2: launch_ptq1_0_planar_lpr<scalar_t, 2>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-        case 4: launch_ptq1_0_planar_lpr<scalar_t, 4>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-        case 8: launch_ptq1_0_planar_lpr<scalar_t, 8>(lpr, w, q, y, inb, irow, ivecs, nblk, stream); break;
-        default: launch_ptq1_0_planar<scalar_t, 16, 32>(w, q, y, inb, irow, ivecs, nblk, stream); break;
-      }
-    } else {
-      mul_mat_vec_ptq1_0_pt_cuda<scalar_t>(w, q, y, icol, irow, ivecs, stream);
-    }
+    run_ptq1_0_rot<scalar_t>(planar, ncols_q, lpr, W.data_ptr(), X.data_ptr(), (const float *) signs.data_ptr(),
+                             quant_X.data_ptr(), (scalar_t *) Y.data_ptr(), icol, inb, irow, ivecs, nblk, stream);
   });
   return Y;
 }
