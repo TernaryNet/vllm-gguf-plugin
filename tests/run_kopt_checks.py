@@ -51,6 +51,8 @@ SHAPES = {  # name: (output rows, K)
     "lm_head": (248320, 5120),
 }
 FOLDED_WIDTHS = (5120, 6144, 17408)
+# planar mat-vec variants: 0 = auto, lanes per row 8 / 16 / 32, +1000 = prefetching loop
+LPR_VARIANTS = (0, 8, 16, 32, 1008, 1016, 1032)
 FAILURES = []
 
 
@@ -203,7 +205,7 @@ def check_planar():
                         continue
                     x = torch.randn((n, k), dtype=dt, device="cuda")
                     ref = ops.ggml_mul_mat_vec_ptq1_0(w, x, rows)
-                    for lpr in (0, 8, 16, 32):
+                    for lpr in LPR_VARIANTS:
                         out = ops.ggml_mul_mat_vec_ptq1_0_planar(wp, x, rows, lpr)
                         ok = torch.equal(out, ref)
                         if not ok or (n in (1, 8) and dt == torch.bfloat16 and rows == 515):
@@ -312,7 +314,7 @@ def bench_matvec(results, cols=(1, 2, 4, 8), reps=20, l2_bytes=200 << 20, shapes
         del base
         nbytes = first.numel()
         ncopies = max(1, -(-l2_bytes // nbytes))
-        variants = [("ggml", None)] + [(f"planar{l}", l) for l in (0, 8, 16, 32)]
+        variants = [("ggml", None)] + [(f"planar{l}", l) for l in LPR_VARIANTS]
         for vname, lpr in variants:
             if lpr is None:
                 copies = [first] + [first.clone() for _ in range(ncopies - 1)]

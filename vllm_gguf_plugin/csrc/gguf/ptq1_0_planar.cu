@@ -90,7 +90,10 @@ static __device__ __forceinline__ void ptq1_0_decode_planar(const uint4 a, const
   }
 }
 
-template <typename scalar_t, int NCOLS, int LPR>
+// PF: load the next group of J blocks before decoding the current one (two
+// groups of weight registers live), so a lane with more than J blocks never
+// waits for DRAM between groups.
+template <typename scalar_t, int NCOLS, int LPR, bool PF>
 static __global__ void __launch_bounds__(WARP_SIZE_GGUF * PTQ1_0_PLANAR_WARPS)
 mul_mat_vec_ptq1_0_planar_kernel(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
                                  scalar_t * __restrict__ dst, const int nb, const int nrows,
@@ -119,23 +122,36 @@ mul_mat_vec_ptq1_0_planar_kernel(const uint8_t * __restrict__ vx, const void * _
     }
   }
 
-  for (int kb0 = sub; kb0 < nbr; kb0 += WARP_SIZE_GGUF) {
-    // all J blocks' weight loads first, then the decodes
-    uint4 a[J];
-    uint2 b[J];
-    uint32_t c[J];
+  uint4 a[J];
+  uint2 b[J];
+  uint32_t c[J];
+  // all J blocks' weight loads first, then the decodes
+  auto load_group = [&](const int kb0, uint4 (&ga)[J], uint2 (&gb)[J], uint32_t (&gc)[J]) {
 #pragma unroll
     for (int jj = 0; jj < J; ++jj) {
       const int kb = kb0 + jj * LPR;
       if (kb < nbr) {
-        a[jj] = __ldg(pa + kb);
-        b[jj] = __ldg(pb + kb);
-        c[jj] = __ldg(pc + kb);
+        ga[jj] = __ldg(pa + kb);
+        gb[jj] = __ldg(pb + kb);
+        gc[jj] = __ldg(pc + kb);
       } else {
-        a[jj] = make_uint4(0, 0, 0, 0);
-        b[jj] = make_uint2(0, 0);
-        c[jj] = 0;
+        ga[jj] = make_uint4(0, 0, 0, 0);
+        gb[jj] = make_uint2(0, 0);
+        gc[jj] = 0;
       }
+    }
+  };
+  if (PF) {
+    load_group(sub, a, b, c);
+  }
+  for (int kb0 = sub; kb0 < nbr; kb0 += WARP_SIZE_GGUF) {
+    uint4 na[J];
+    uint2 nb_[J];
+    uint32_t nc[J];
+    if (PF) {
+      load_group(kb0 + WARP_SIZE_GGUF, na, nb_, nc);
+    } else {
+      load_group(kb0, a, b, c);
     }
 #pragma unroll
     for (int jj = 0; jj < J; ++jj) {
@@ -173,6 +189,14 @@ mul_mat_vec_ptq1_0_planar_kernel(const uint8_t * __restrict__ vx, const void * _
         acc[jj][j] += d * sum;
       }
     }
+    if (PF) {
+#pragma unroll
+      for (int jj = 0; jj < J; ++jj) {
+        a[jj] = na[jj];
+        b[jj] = nb_[jj];
+        c[jj] = nc[jj];
+      }
+    }
   }
 
   // the reference's butterfly over v = sub + LPR * jj, highest mask first
@@ -207,24 +231,28 @@ mul_mat_vec_ptq1_0_planar_kernel(const uint8_t * __restrict__ vx, const void * _
 #endif
 }
 
-template <typename scalar_t, int NCOLS, int LPR>
+template <typename scalar_t, int NCOLS, int LPR, bool PF = false>
 static void launch_ptq1_0_planar(const void * vx, const void * vy, scalar_t * dst, const int nb,
                                  const int nrows, const int nvecs, const int nblk, cudaStream_t stream) {
   constexpr int rows_per_cta = PTQ1_0_PLANAR_WARPS * (WARP_SIZE_GGUF / LPR);
   const dim3 grid((nrows + rows_per_cta - 1) / rows_per_cta, 1, 1);
   const dim3 block(WARP_SIZE_GGUF * PTQ1_0_PLANAR_WARPS, 1, 1);
-  mul_mat_vec_ptq1_0_planar_kernel<scalar_t, NCOLS, LPR>
+  mul_mat_vec_ptq1_0_planar_kernel<scalar_t, NCOLS, LPR, PF>
       <<<grid, block, 0, stream>>>((const uint8_t *) vx, vy, dst, nb, nrows, nvecs, nblk);
 }
 
+// variant code: lanes per row 8 / 16 / 32, plus 1000 for the prefetching loop
 template <typename scalar_t, int NCOLS>
-static void launch_ptq1_0_planar_lpr(const int lpr, const void * vx, const void * vy, scalar_t * dst,
+static void launch_ptq1_0_planar_lpr(const int variant, const void * vx, const void * vy, scalar_t * dst,
                                      const int nb, const int nrows, const int nvecs, const int nblk,
                                      cudaStream_t stream) {
-  switch (lpr) {
-    case 8:  launch_ptq1_0_planar<scalar_t, NCOLS, 8>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
-    case 16: launch_ptq1_0_planar<scalar_t, NCOLS, 16>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
-    default: launch_ptq1_0_planar<scalar_t, NCOLS, 32>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+  switch (variant) {
+    case 8:    launch_ptq1_0_planar<scalar_t, NCOLS, 8>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 16:   launch_ptq1_0_planar<scalar_t, NCOLS, 16>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 1008: launch_ptq1_0_planar<scalar_t, NCOLS, 8, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 1016: launch_ptq1_0_planar<scalar_t, NCOLS, 16, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 1032: launch_ptq1_0_planar<scalar_t, NCOLS, 32, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    default:   launch_ptq1_0_planar<scalar_t, NCOLS, 32>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
   }
 }
 
@@ -241,7 +269,8 @@ static int ptq1_0_planar_auto_lpr(const int nb, const int ncols_q) {
 }
 
 // Y[vecs, row] = X[vecs, K] @ W^T for a planar PTQ1_0 W, vecs <= 16;
-// lanes_per_row 0 = auto, else 8 / 16 / 32.
+// lanes_per_row 0 = auto, else 8 / 16 / 32 (+1000 = prefetching loop); 16
+// columns always run 32 lanes per row.
 Tensor ggml_mul_mat_vec_ptq1_0_planar(Tensor W, Tensor X, int64_t row, int64_t lanes_per_row) {
   const int64_t col = X.sizes()[1];
   const int64_t vecs = X.sizes()[0];
@@ -252,17 +281,16 @@ Tensor ggml_mul_mat_vec_ptq1_0_planar(Tensor W, Tensor X, int64_t row, int64_t l
   STD_TORCH_CHECK(W.dim() == 2 && W.sizes()[0] == row && W.sizes()[1] == nb * 28 && W.is_contiguous(),
                   "planar PTQ1_0 weight must be a contiguous [row, K/128*28] byte tensor");
   STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(W.data_ptr()) % 16 == 0, "planar PTQ1_0 weight must be 16-byte aligned");
-  STD_TORCH_CHECK(lanes_per_row == 0 || lanes_per_row == 8 || lanes_per_row == 16 || lanes_per_row == 32,
-                  "lanes_per_row must be 0, 8, 16 or 32");
+  const int64_t lpr_base = lanes_per_row % 1000;
+  STD_TORCH_CHECK(lanes_per_row == 0 ||
+                      (lanes_per_row < 2000 && (lpr_base == 8 || lpr_base == 16 || lpr_base == 32)),
+                  "lanes_per_row must be 0, 8, 16 or 32 (+1000: prefetching loop)");
   const int32_t device_idx = X.get_device_index();
   const DeviceGuard device_guard(device_idx);
   cudaStream_t stream = ptq1_0_planar_stream(device_idx);
   const int nblk = ptq1_0_pt_nblk(col);
   const int64_t ncols_q = ptq1_0_pt_ncols(vecs);
-  int lpr = lanes_per_row ? (int) lanes_per_row : ptq1_0_planar_auto_lpr((int) nb, (int) ncols_q);
-  if (ncols_q >= 16) {
-    lpr = 32;
-  }
+  const int lpr = lanes_per_row ? (int) lanes_per_row : ptq1_0_planar_auto_lpr((int) nb, (int) ncols_q);
   Tensor quant_X = torch::stable::new_empty(W, {ncols_q, (int64_t) PTQ1_0_PT_PLANES * nblk * 4}, ScalarType::Int);
   Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
   const int inb = (int) nb, irow = (int) row, ivecs = (int) vecs;
