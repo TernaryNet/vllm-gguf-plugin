@@ -1,5 +1,8 @@
+import functools
+
 import torch
 
+from ...ggml_ext import GGML_TYPE_PTQ1_0_PLANAR
 from .iq_quant.iq1_m import ggml_gemm_iq1_m_triton
 from .iq_quant.iq1_s import ggml_gemm_iq1_s_triton
 from .iq_quant.iq2_s import ggml_gemm_iq2_s_triton
@@ -71,6 +74,7 @@ def ggml_mul_mat_a8_triton(
         GGML_TYPE_Q8_0: ggml_gemm_q8_0_triton,
         GGML_TYPE_Q8_1: ggml_gemm_q8_1_triton,
         GGML_TYPE_PTQ1_0: ggml_gemm_ptq1_0_triton,
+        GGML_TYPE_PTQ1_0_PLANAR: functools.partial(ggml_gemm_ptq1_0_triton, planar=True),
     }.get(int(quant_type))
     if kernel is None:
         raise ValueError(f"Unsupported Triton quant type: {quant_type}")

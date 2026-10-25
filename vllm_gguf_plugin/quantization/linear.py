@@ -29,7 +29,10 @@ from .utils import (
     MMQ_QUANT_TYPES,
     MMVQ_QUANT_TYPES,
     PRISM_TERNARY_TYPES,
+    PTQ1_0_PLANAR,
+    PTQ1_0_PLANAR_SIZES,
     UNQUANTIZED_TYPES,
+    logger,
 )
 
 # PTQ1_0 has no MMQ kernel. Measured on an L4 for the Bonsai-27B shapes with
@@ -47,6 +50,96 @@ _PRISM_TRITON_GEMM_MAX_ROWS = 256
 # copy stays well under the whole-matrix footprint.
 _PRISM_DEQUANT_ROW_CHUNK = 16384
 
+#: ``VLLM_GGUF_PTQ1_0_PLANAR``: ``auto`` (default) re-lays every PTQ1_0 weight
+#: whose rows hold a multiple of 4 blocks out into per-row planes at load time
+#: when the plugin build has the planar CUDA kernels, ``1`` requires it
+#: (refuses to load otherwise), ``0`` keeps the GGML block order.
+PTQ1_0_PLANAR_ENV = "VLLM_GGUF_PTQ1_0_PLANAR"
+# rows repacked per step, so the temporary copy stays small next to the head
+_PTQ1_0_PLANAR_ROW_CHUNK = 8192
+_PTQ1_0_PLANAR_LOGGED: set[str] = set()
+
+
+def _ptq1_0_planar_mode() -> str:
+    import os
+
+    mode = os.environ.get(PTQ1_0_PLANAR_ENV, "auto").strip().lower()
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"{PTQ1_0_PLANAR_ENV} must be auto, 0 or 1, got {mode!r}")
+    return mode
+
+
+def _check_ptq1_0_rows(weight: torch.Tensor) -> int:
+    rows, width = weight.shape
+    nb, remainder = divmod(width, PTQ1_0_PLANAR_SIZES[1])
+    if remainder or nb % 4:
+        raise ValueError(
+            f"PTQ1_0 row of {width} bytes is not a whole multiple of 4 blocks "
+            "(the planar layout needs 16-byte aligned rows)"
+        )
+    return nb
+
+
+def repack_ptq1_0_planar(weight: torch.Tensor) -> torch.Tensor:
+    """Rewrite PTQ1_0 rows (GGML block order) in place into the planar layout.
+
+    Row r becomes ``qs[0:16]`` of its nb blocks, then ``qs[16:24]`` of them,
+    then their ``qh[0:2] + d`` -- the same bytes and row width
+    (``csrc/gguf/ptq1_0_planar.cu``). Works on any device; done in row chunks.
+    """
+    nb = _check_ptq1_0_rows(weight)
+    if not weight.is_contiguous():
+        raise ValueError("PTQ1_0 weight to repack must be contiguous")
+    for start in range(0, weight.shape[0], _PTQ1_0_PLANAR_ROW_CHUNK):
+        chunk = weight[start : start + _PTQ1_0_PLANAR_ROW_CHUNK]
+        blocks = chunk.view(chunk.shape[0], nb, PTQ1_0_PLANAR_SIZES[1])
+        planar = torch.cat(
+            (
+                blocks[:, :, :16].reshape(chunk.shape[0], nb * 16),
+                blocks[:, :, 16:24].reshape(chunk.shape[0], nb * 8),
+                blocks[:, :, 24:].reshape(chunk.shape[0], nb * 4),
+            ),
+            dim=1,
+        )
+        chunk.copy_(planar)
+    return weight
+
+
+def unpack_ptq1_0_planar(weight: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`repack_ptq1_0_planar`, as a new tensor (tests, debugging)."""
+    nb = _check_ptq1_0_rows(weight)
+    rows = weight.shape[0]
+    return torch.cat(
+        (
+            weight[:, : 16 * nb].reshape(rows, nb, 16),
+            weight[:, 16 * nb : 24 * nb].reshape(rows, nb, 8),
+            weight[:, 24 * nb :].reshape(rows, nb, 4),
+        ),
+        dim=2,
+    ).reshape(rows, nb * PTQ1_0_PLANAR_SIZES[1])
+
+
+def _quant_sizes(weight_type: int) -> tuple[int, int]:
+    if weight_type == PTQ1_0_PLANAR:
+        return PTQ1_0_PLANAR_SIZES
+    return gguf.GGML_QUANT_SIZES[weight_type]
+
+
+def _dequant_matmul(
+    x: torch.Tensor, weight: torch.Tensor, weight_type: int
+) -> torch.Tensor:
+    block_size, type_size = _quant_sizes(weight_type)
+    hidden = weight.shape[1] // type_size * block_size
+    if weight.shape[0] <= _PRISM_DEQUANT_ROW_CHUNK:
+        dense = ops.ggml_dequantize(weight, weight_type, weight.shape[0], hidden, x.dtype)
+        return x @ dense.T
+    outputs = []
+    for start in range(0, weight.shape[0], _PRISM_DEQUANT_ROW_CHUNK):
+        chunk = weight[start : start + _PRISM_DEQUANT_ROW_CHUNK]
+        dense = ops.ggml_dequantize(chunk, weight_type, chunk.shape[0], hidden, x.dtype)
+        outputs.append(x @ dense.T)
+    return torch.cat(outputs, dim=1)
+
 
 def _fused_mul_mat_gguf(
     x: torch.Tensor, weight: torch.Tensor, weight_type: int
@@ -59,6 +152,15 @@ def _fused_mul_mat_gguf(
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type in UNQUANTIZED_TYPES:
         return x @ weight.T
+    if weight_type == PTQ1_0_PLANAR:
+        # same tiers as GGML-order PTQ1_0; every kernel reads the planar rows
+        if x.shape[0] <= _PRISM_MMV_MAX_ROWS:
+            return ops.ggml_mul_mat_vec_ptq1_0_planar(
+                weight, x.contiguous(), weight.shape[0]
+            )
+        if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
+            return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
+        return _dequant_matmul(x, weight, weight_type)
     if weight_type in PRISM_TERNARY_TYPES:
         if x.shape[0] <= _PRISM_MMV_MAX_ROWS and ops.ptq1_0_mmv_available():
             return ops.ggml_mul_mat_vec_ptq1_0(weight, x, weight.shape[0])
@@ -66,21 +168,7 @@ def _fused_mul_mat_gguf(
             return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
         if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
             return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
-        block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
-        hidden = weight.shape[1] // type_size * block_size
-        if weight.shape[0] <= _PRISM_DEQUANT_ROW_CHUNK:
-            dense = ops.ggml_dequantize(
-                weight, weight_type, weight.shape[0], hidden, x.dtype
-            )
-            return x @ dense.T
-        outputs = []
-        for start in range(0, weight.shape[0], _PRISM_DEQUANT_ROW_CHUNK):
-            chunk = weight[start : start + _PRISM_DEQUANT_ROW_CHUNK]
-            dense = ops.ggml_dequantize(
-                chunk, weight_type, chunk.shape[0], hidden, x.dtype
-            )
-            outputs.append(x @ dense.T)
-        return torch.cat(outputs, dim=1)
+        return _dequant_matmul(x, weight, weight_type)
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
     elif weight_type in MMQ_QUANT_TYPES:
@@ -113,6 +201,40 @@ try:
     fused_mul_mat_gguf = torch.ops.vllm._fused_mul_mat_gguf
 except AttributeError as error:
     raise error
+
+#: ``VLLM_GGUF_FUSED_ROT``: ``1`` runs Hadamard-folded PTQ1_0 linears at 1-8
+#: rows through one kernel that applies the signs, the 1024-point FWHT (fp32)
+#: and the Q8 quantize before the mat-vec (``ggml_mul_mat_vec_ptq1_0_rot``);
+#: ``0`` (default) keeps the separate rotation + quantize. Needs Hadacore for
+#: the rows above 8, which take the rotation + regular tiers inside the op.
+FUSED_ROT_ENV = "VLLM_GGUF_FUSED_ROT"
+
+
+def _fused_rot_mul_mat_gguf(
+    x: torch.Tensor, weight: torch.Tensor, weight_type: int, signs: torch.Tensor
+) -> torch.Tensor:
+    if x.shape[0] == 0:
+        return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+    if x.shape[0] <= _PRISM_MMV_MAX_ROWS:
+        return ops.ggml_mul_mat_vec_ptq1_0_rot(
+            weight, x.contiguous(), signs, weight.shape[0], weight_type == PTQ1_0_PLANAR
+        )
+    rotated = (x * signs.to(x.dtype)).reshape(-1, 1024)
+    rotated = torch.ops._C.hadacore_transform(rotated, False).reshape(x.shape)
+    return _fused_mul_mat_gguf(rotated, weight, weight_type)
+
+
+def _fused_rot_mul_mat_gguf_fake(
+    x: torch.Tensor, weight: torch.Tensor, weight_type: int, signs: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="_fused_rot_mul_mat_gguf",
+    op_func=_fused_rot_mul_mat_gguf,
+    fake_impl=_fused_rot_mul_mat_gguf_fake,
+)
 
 
 @register_weight_loader_v2_supported_method
@@ -189,19 +311,100 @@ class GGUFLinearMethod(LinearMethodBase):
                 },
             )
 
+    #: Re-lay PTQ1_0 weights out planar at load time (``VLLM_GGUF_PTQ1_0_PLANAR``).
+    #: Subclasses whose forward reads weights some other way opt out.
+    ptq1_0_planar_repack = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         self._materialize_gguf_parameters(layer)
         weight_type = layer.weight_type.weight_type
-        if not (weight_type in UNQUANTIZED_TYPES or weight_type in DEQUANT_TYPES):
+        if not (
+            weight_type in UNQUANTIZED_TYPES
+            or weight_type in DEQUANT_TYPES
+            or weight_type == PTQ1_0_PLANAR
+        ):
             weight_type = WeightType(weight_type)
             raise ValueError(
                 f"Unsupported GGUF quantization type {weight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        self._maybe_repack_ptq1_0_planar(layer)
         if self.layout is not None:
             # Constants used by the input transform must live on the weight's
             # device before the first (traced / CUDA-graph captured) forward.
             self.layout.prepare(layer.weight.device)
+        self._fused_rot = self._resolve_fused_rotation(layer)
+
+    def _resolve_fused_rotation(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, int] | None:
+        """(fp32 signs, weight type) for the fused rotate + quantize mat-vec, or None."""
+        import os
+
+        from .hadamard import GGUFHadamardLayout
+
+        mode = os.environ.get(FUSED_ROT_ENV, "0").strip()
+        if mode not in ("0", "1"):
+            raise ValueError(f"{FUSED_ROT_ENV} must be 0 or 1, got {mode!r}")
+        layout = self.layout
+        if mode == "0" or not isinstance(layout, GGUFHadamardLayout):
+            return None
+        types = {int(layer.weight_type.weight_type)} | {
+            int(t) for t in layer.weight_type.shard_weight_type.values()
+        }
+        usable = (
+            ops.fused_rot_available()
+            and layout.forward
+            and layout.block_size == 1024
+            and layout._hadacore is not None
+            and torch.float32 in layout._signs
+            and len(types) == 1
+            and types <= {int(WeightType.PTQ1_0), PTQ1_0_PLANAR}
+        )
+        if not usable:
+            return None
+        return layout._signs[torch.float32], next(iter(types))
+
+    def _maybe_repack_ptq1_0_planar(self, layer: torch.nn.Module) -> None:
+        mode = _ptq1_0_planar_mode()
+        if mode == "0" or not self.ptq1_0_planar_repack:
+            return
+        weight_type = layer.weight_type
+        types = {int(weight_type.weight_type)} | {
+            int(t) for t in weight_type.shard_weight_type.values()
+        }
+        if types != {int(WeightType.PTQ1_0)}:
+            return
+        weight = layer.weight
+        width = weight.shape[1]
+        reason = ""
+        if not weight.is_cuda:
+            reason = "weight is not on a CUDA device"
+        elif not ops.ptq1_0_planar_available():
+            reason = "plugin build without the planar PTQ1_0 kernels"
+        elif width % PTQ1_0_PLANAR_SIZES[1] or (width // PTQ1_0_PLANAR_SIZES[1]) % 4:
+            reason = f"row of {width} bytes is not a multiple of 4 blocks"
+        elif not weight.is_contiguous():
+            reason = "weight is not contiguous"
+        if reason:
+            if mode == "1":
+                raise RuntimeError(f"{PTQ1_0_PLANAR_ENV}=1 but {layer}: {reason}")
+            if reason not in _PTQ1_0_PLANAR_LOGGED:
+                _PTQ1_0_PLANAR_LOGGED.add(reason)
+                logger.info("PTQ1_0 weights kept in GGML block order: %s", reason)
+            return
+        repack_ptq1_0_planar(weight.data)
+        weight_type.weight_type = PTQ1_0_PLANAR
+        weight_type.shard_weight_type = dict.fromkeys(
+            weight_type.shard_weight_type, PTQ1_0_PLANAR
+        )
+        if "planar" not in _PTQ1_0_PLANAR_LOGGED:
+            _PTQ1_0_PLANAR_LOGGED.add("planar")
+            logger.info(
+                "PTQ1_0 weights re-laid out planar for the coalesced mat-vec "
+                "(%s=0 keeps GGML block order)",
+                PTQ1_0_PLANAR_ENV,
+            )
 
     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
         self._materialize_weight(layer)
@@ -268,6 +471,19 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
+        fused = getattr(self, "_fused_rot", None)
+        if (
+            fused is not None
+            and x.dim() == 2
+            and x.shape[-1] == fused[0].shape[0]
+            and x.dtype in (torch.bfloat16, torch.float16)
+        ):
+            # signs + FWHT + Q8 quantize + mat-vec in the op (1-8 rows)
+            signs, weight_type = fused
+            out = torch.ops.vllm._fused_rot_mul_mat_gguf(x, layer.weight, weight_type, signs)
+            if bias is not None:
+                out.add_(bias)
+            return out
         if self.layout is not None:
             x = self.layout.input_to_gguf(x)
 

@@ -48,6 +48,7 @@ if _should_build_extension():
                 sources=[
                     "vllm_gguf_plugin/csrc/torch_bindings.cpp",
                     "vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu",
+                    "vllm_gguf_plugin/csrc/gguf/ptq1_0_planar.cu",
                 ],
                 include_dirs=[
                     "vllm_gguf_plugin/csrc",

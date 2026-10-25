@@ -4,6 +4,7 @@ import os
 
 import torch
 
+from .ggml_ext import GGML_TYPE_PTQ1_0_PLANAR
 from .triton.dequantize.interface import ggml_dequantize_triton
 from .triton.fused_moe.interface import ggml_moe_a8_triton
 from .triton.fused_moe.utils import get_triton_moe_block_m
@@ -185,12 +186,50 @@ if (
         return torch.empty((X.size(0) * top_k, row), dtype=X.dtype, device=W.device)
 
 
+if (
+    _CUDA_AVAILABLE
+    and hasattr(torch.ops, "_C_gguf")
+    and hasattr(torch.ops._C_gguf, "ggml_mul_mat_vec_ptq1_0_planar")
+):
+
+    @register_fake("_C_gguf::ggml_mul_mat_vec_ptq1_0_planar")
+    def _ggml_mul_mat_vec_ptq1_0_planar_fake(
+        W: torch.Tensor,
+        X: torch.Tensor,
+        row: torch.SymInt,
+        lanes_per_row: int,
+    ) -> torch.Tensor:
+        return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
+
+    @register_fake("_C_gguf::ggml_mul_mat_vec_ptq1_0_rot")
+    def _ggml_mul_mat_vec_ptq1_0_rot_fake(
+        W: torch.Tensor,
+        X: torch.Tensor,
+        signs: torch.Tensor,
+        row: torch.SymInt,
+        planar: bool,
+    ) -> torch.Tensor:
+        return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
+
+    @register_fake("_C_gguf::ggml_dequantize_ptq1_0_planar")
+    def _ggml_dequantize_ptq1_0_planar_fake(
+        W: torch.Tensor,
+        m: torch.SymInt,
+        n: torch.SymInt,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        return torch.empty((m, n), dtype=dtype or torch.float16, device=W.device)
+
+
 # --- Public API ---
 
 
 def ggml_dequantize(
     W: torch.Tensor, quant_type: int, m: int, n: int, dtype: torch.dtype | None
 ) -> torch.Tensor:
+    if quant_type == GGML_TYPE_PTQ1_0_PLANAR:
+        # CUDA only: the repack is never done without this kernel
+        return torch.ops._C_gguf.ggml_dequantize_ptq1_0_planar(W, m, n, dtype)
     if _cuda_kernel_available("ggml_dequantize", quant_type):
         return torch.ops._C_gguf.ggml_dequantize(W, quant_type, m, n, dtype)
     return ggml_dequantize_triton(W, quant_type, m, n, dtype)
@@ -218,6 +257,35 @@ def ptq1_0_mmv_available() -> bool:
 def ggml_mul_mat_vec_ptq1_0(W: torch.Tensor, X: torch.Tensor, row: int) -> torch.Tensor:
     """PTQ1_0 mat-vec that decodes each weight block once for up to 8 rows of X."""
     return torch.ops._C_gguf.ggml_mul_mat_vec_ptq1_0(W, X, row)
+
+
+def ptq1_0_planar_available() -> bool:
+    """CUDA kernels for planar PTQ1_0 weights (mat-vec and dequantize) present."""
+    return _cuda_kernel_available(
+        "ggml_mul_mat_vec_ptq1_0_planar"
+    ) and _cuda_kernel_available("ggml_dequantize_ptq1_0_planar")
+
+
+def ggml_mul_mat_vec_ptq1_0_planar(
+    W: torch.Tensor, X: torch.Tensor, row: int, lanes_per_row: int = 0
+) -> torch.Tensor:
+    """Planar PTQ1_0 mat-vec, 1-16 rows of X; same output bits as the GGML one.
+
+    *lanes_per_row* 0 picks per shape; 8 / 16 / 32 force a variant (bench).
+    """
+    return torch.ops._C_gguf.ggml_mul_mat_vec_ptq1_0_planar(W, X, row, lanes_per_row)
+
+
+def fused_rot_available() -> bool:
+    """CUDA kernel fusing sign + FWHT-1024 + Q8 quantize into the PTQ1_0 mat-vec."""
+    return _cuda_kernel_available("ggml_mul_mat_vec_ptq1_0_rot")
+
+
+def ggml_mul_mat_vec_ptq1_0_rot(
+    W: torch.Tensor, X: torch.Tensor, signs: torch.Tensor, row: int, planar: bool
+) -> torch.Tensor:
+    """``(H (signs * X)) @ W^T`` for 1-16 rows of X, H the 1024-block Hadamard."""
+    return torch.ops._C_gguf.ggml_mul_mat_vec_ptq1_0_rot(W, X, signs, row, planar)
 
 
 def ggml_mul_mat_a8(

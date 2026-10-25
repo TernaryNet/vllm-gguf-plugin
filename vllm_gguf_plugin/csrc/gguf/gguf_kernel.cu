@@ -90,6 +90,8 @@ Tensor ggml_dequantize(Tensor W,  // quant weight
                        std::optional<ScalarType> dtype) {
   const int32_t device_idx = W.get_device_index();
   const DeviceGuard device_guard(device_idx);
+  STD_TORCH_CHECK(type != 1143,
+                  "planar PTQ1_0 (1143) goes through ggml_dequantize_ptq1_0_planar");
   const auto dtype_ = dtype.value_or(ScalarType::Half);
   Tensor DW = torch::stable::new_zeros(W, {m, n}, dtype_);
   cudaStream_t stream = get_current_cuda_stream(device_idx);
@@ -105,6 +107,8 @@ Tensor ggml_dequantize(Tensor W,  // quant weight
 Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
                            Tensor X,  // input
                            int64_t type, int64_t row) {
+  STD_TORCH_CHECK(type != 1143,
+                  "planar PTQ1_0 (1143) has no generic MMVQ kernel");
   int64_t col = X.sizes()[1];
   int64_t vecs = X.sizes()[0];
   const int64_t padded = (col + 512 - 1) / 512 * 512;

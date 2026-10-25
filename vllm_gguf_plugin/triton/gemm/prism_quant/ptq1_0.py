@@ -92,12 +92,16 @@ def ptq1_0_gemm_kernel(
     stride_yn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PLANAR: tl.constexpr = False,
 ):
     """Y = X @ W^T for PTQ1_0 weights and pre-quantized Q8 activations.
 
     Each 128-weight block is decoded from three contiguous byte loads
     (qs[0:16], qs[16:24], qh[0:2]); see block_ptq1_0 in ggml-common.h for the
     element order, which fixes which digits feed each 32-element sub-block.
+    With ``PLANAR`` the weight rows are in the load-time planar layout
+    (csrc/gguf/ptq1_0_planar.cu): only the three load addresses and the
+    scale's change, so the results are bit-identical.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -132,16 +136,23 @@ def ptq1_0_gemm_kernel(
     isum_row_ptrs = isum_ptr + offs_m * num_sub_blocks
 
     for kb in range(0, num_k_blocks):
-        block_ptrs = w_row_ptrs + kb * 28
-        d_w = load_f16_from_u8(block_ptrs + 26, n_mask).to(tl.float32)
+        if PLANAR:
+            qs0_ptrs = w_row_ptrs + kb * 16
+            qs1_ptrs = w_row_ptrs + num_k_blocks * 16 + kb * 8
+            qh_ptrs = w_row_ptrs + num_k_blocks * 24 + kb * 4
+        else:
+            qs0_ptrs = w_row_ptrs + kb * 28
+            qs1_ptrs = qs0_ptrs + 16
+            qh_ptrs = qs0_ptrs + 24
+        d_w = load_f16_from_u8(qh_ptrs + 2, n_mask).to(tl.float32)
         qs0 = tl.load(
-            block_ptrs[:, None] + offs_16[None, :], mask=n_mask[:, None], other=0
+            qs0_ptrs[:, None] + offs_16[None, :], mask=n_mask[:, None], other=0
         )
         qs1 = tl.load(
-            block_ptrs[:, None] + 16 + offs_8[None, :], mask=n_mask[:, None], other=0
+            qs1_ptrs[:, None] + offs_8[None, :], mask=n_mask[:, None], other=0
         )
         qh = tl.load(
-            block_ptrs[:, None] + 24 + offs_2[None, :], mask=n_mask[:, None], other=0
+            qh_ptrs[:, None] + offs_2[None, :], mask=n_mask[:, None], other=0
         )
         qs0 = qs0.to(tl.int32)
         qs1 = qs1.to(tl.int32)
@@ -215,7 +226,10 @@ def quantize_q8_sub_blocks(
     return q, d, isum
 
 
-def ggml_gemm_ptq1_0_triton(W: torch.Tensor, X: torch.Tensor, row: int) -> torch.Tensor:
+def ggml_gemm_ptq1_0_triton(
+    W: torch.Tensor, X: torch.Tensor, row: int, planar: bool = False
+) -> torch.Tensor:
+    """PTQ1_0 GEMM; *planar* reads the load-time planar row layout."""
     W, x_2d, x_shape, num_k_blocks = _validate_args(W, X, row, GGML_TYPE_PTQ1_0)
     q, d, isum = quantize_q8_sub_blocks(x_2d)
     y_2d = torch.empty((x_2d.shape[0], row), device=X.device, dtype=X.dtype)
@@ -239,6 +253,7 @@ def ggml_gemm_ptq1_0_triton(W: torch.Tensor, X: torch.Tensor, row: int) -> torch
         y_2d.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=PTQ1_0_GEMM_BLOCK_N,
+        PLANAR=planar,
         num_warps=8 if block_m >= 128 else 4,
         num_stages=2 if block_m >= 128 else 1,
     )

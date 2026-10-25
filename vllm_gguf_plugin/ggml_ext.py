@@ -36,6 +36,13 @@ QK_PTQ1_0 = 128
 PTQ1_0_BLOCK_BYTES = 24 + 2 + 2
 QK_PQ2_0 = 128
 PQ2_0_BLOCK_BYTES = 2 + QK_PQ2_0 // 4
+#: Internal weight-type id of a PTQ1_0 weight re-laid out at load time into
+#: per-row planes (``qs[0:16]`` | ``qs[16:24]`` | ``qh + d``, same 28 bytes per
+#: block; see ``csrc/gguf/ptq1_0_planar.cu``). Not a GGML type: it never appears
+#: in a file and is not added to the enum. Every consumer of a weight
+#: dispatches on it explicitly, so a path that does not know the layout refuses
+#: it instead of misreading the bytes.
+GGML_TYPE_PTQ1_0_PLANAR = 1143
 
 _PRISM_TENSOR_TYPES = (
     ("PQ2_0", GGML_TYPE_PQ2_0, (QK_PQ2_0, PQ2_0_BLOCK_BYTES)),
