@@ -2,9 +2,10 @@
 """GPU checks and micro-benchmarks for the Hadacore rotation, the planar PTQ1_0
 mat-vec and the fused rotate + quantize mat-vec, without pytest.
 
-Run in the engine venv with this checkout first on the path:
+Run in the engine venv with this checkout first on the path (not with -I, which
+would drop PYTHONPATH):
 
-    PYTHONPATH=$HOME/k_plugin /home/ubuntu/vllm-env/bin/python -I \\
+    PYTHONPATH=$HOME/k_plugin /home/ubuntu/vllm-env/bin/python \\
         $HOME/k_plugin/tests/run_kopt_checks.py --hadamard --planar --fused --bench --out B.json
 
 --hadamard  Hadacore vs the dense ``x @ H`` rotation (and both vs an fp64 reference) on
@@ -346,6 +347,26 @@ def bench_rotation(results, reps=200):
                 print(f"rotation width={width} m={m} {vname:8s} {us:6.2f} us (incl. sign multiply)", flush=True)
 
 
+def bench_small_m(results, reps=200):
+    """BF16 in_proj_ba-shaped GEMMs ([M, 5120] x [5120, 96]) at 1-8 rows, call variants."""
+    w = torch.randn((96, 5120), dtype=torch.bfloat16, device="cuda") / 64
+    for m in (1, 2, 3, 4, 8):
+        x = torch.randn((m, 5120), dtype=torch.bfloat16, device="cuda")
+        ref = (x.float() @ w.float().T)
+        variants = {
+            "x@w.T": lambda: x @ w.T,
+            "(w@x.T).T.contig": lambda: (w @ x.T).T.contiguous(),
+            "per-row mv": lambda: torch.stack([torch.mv(w, x[i]) for i in range(m)]),
+            "bmm-rows": lambda: torch.bmm(w.unsqueeze(0).expand(m, -1, -1), x.unsqueeze(-1)).squeeze(-1),
+        }
+        for name, fn in variants.items():
+            out = fn()
+            err = ((out.float() - ref).abs().max() / ref.abs().max()).item()
+            us = _time_graph(lambda i, fn=fn: fn(), reps, 3)
+            results.append({"bench": "small_m", "m": m, "variant": name, "us": us, "max_rel_err": err})
+            print(f"in_proj_ba m={m} {name:18s} {us:7.2f} us max rel err {err:.2e}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hadamard", action="store_true")
@@ -353,23 +374,27 @@ def main():
     parser.add_argument("--fused", action="store_true")
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--bench-shapes", nargs="*", help="subset of the bench shapes")
+    parser.add_argument("--bench-small-m", action="store_true", help="in_proj_ba-shaped BF16 GEMM variants")
     parser.add_argument("--out", help="write bench results JSON here")
     args = parser.parse_args()
     print(f"run_kopt_checks plugin={vllm_gguf_plugin.__file__} torch={torch.__version__} "
           f"gpu={torch.cuda.get_device_name()} utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
           f"env VLLM_GGUF_HADACORE={os.environ.get('VLLM_GGUF_HADACORE', '(unset)')} "
           f"VLLM_GGUF_PTQ1_0_PLANAR={os.environ.get('VLLM_GGUF_PTQ1_0_PLANAR', '(unset)')}", flush=True)
-    if not (args.hadamard or args.planar or args.fused or args.bench):
-        parser.error("pass --hadamard, --planar, --fused and/or --bench")
-    if args.out and not args.bench:
-        parser.error("--out needs --bench")
+    if not (args.hadamard or args.planar or args.fused or args.bench or args.bench_small_m):
+        parser.error("pass --hadamard, --planar, --fused, --bench and/or --bench-small-m")
+    if args.out and not (args.bench or args.bench_small_m):
+        parser.error("--out needs --bench or --bench-small-m")
     for flag, fn in ((args.hadamard, check_hadamard), (args.planar, check_planar), (args.fused, check_fused)):
         if flag and fn() == 2:
             return 2
-    if args.bench:
+    if args.bench or args.bench_small_m:
         results = []
-        bench_rotation(results)
-        bench_matvec(results, shapes=args.bench_shapes)
+        if args.bench_small_m:
+            bench_small_m(results)
+        if args.bench:
+            bench_rotation(results)
+            bench_matvec(results, shapes=args.bench_shapes)
         if args.out:
             with open(args.out, "w") as handle:
                 json.dump(results, handle, indent=1)
