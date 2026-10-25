@@ -639,6 +639,9 @@ template <typename out_t>
 static void ptq1_0_mma_gemm_cuda(const int8_t * q, const half * dq, const void * w, out_t * y, const int M,
                                  const int N, const int K, const int variant, cudaStream_t stream) {
     const uint8_t * wb = static_cast<const uint8_t *>(w);
+    // bench-only ablation bits (variant >> 8: 1 skip decode, 2 skip raw weight loads, 4 skip
+    // activation loads, 8 skip the barrier); 0 in every real call. Kept because removing the
+    // runtime checks re-schedules the default tile ~4 % slower on the L40S (measured).
     const int ablate = variant >> 8;
     switch (variant & 255) {
         case 1: launch_gemm<out_t, Cfg1>(q, dq, wb, y, M, N, K, stream, ablate); break;
