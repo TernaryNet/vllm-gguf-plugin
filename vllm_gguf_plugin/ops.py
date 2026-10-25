@@ -201,6 +201,10 @@ if (
     ) -> torch.Tensor:
         return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
 
+    @register_fake("_C_gguf::small_m_gemv")
+    def _small_m_gemv_fake(W: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        return torch.empty((X.shape[0], W.shape[0]), dtype=X.dtype, device=X.device)
+
     @register_fake("_C_gguf::ggml_mul_mat_vec_ptq1_0_rot")
     def _ggml_mul_mat_vec_ptq1_0_rot_fake(
         W: torch.Tensor,
@@ -286,6 +290,16 @@ def ggml_mul_mat_vec_ptq1_0_rot(
 ) -> torch.Tensor:
     """``(H (signs * X)) @ W^T`` for 1-16 rows of X, H the 1024-block Hadamard."""
     return torch.ops._C_gguf.ggml_mul_mat_vec_ptq1_0_rot(W, X, signs, row, planar)
+
+
+def small_m_gemv_available() -> bool:
+    """CUDA kernel for unquantized X @ W^T at 2-8 rows of X."""
+    return _cuda_kernel_available("small_m_gemv")
+
+
+def small_m_gemv(W: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    """``X @ W.T`` for 2-8 rows of X (bf16 / fp16 / fp32), one CTA per row of W."""
+    return torch.ops._C_gguf.small_m_gemv(W, X)
 
 
 def ggml_mul_mat_a8(

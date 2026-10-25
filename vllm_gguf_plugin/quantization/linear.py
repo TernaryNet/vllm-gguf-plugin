@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
@@ -49,6 +51,13 @@ _PRISM_TRITON_GEMM_MAX_ROWS = 256
 # Dequantize wide weights (the 248k-row Bonsai head) in row chunks so the bf16
 # copy stays well under the whole-matrix footprint.
 _PRISM_DEQUANT_ROW_CHUNK = 16384
+
+#: ``VLLM_GGUF_SMALL_M_GEMV=1``: unquantized linears with at most
+#: ``_SMALL_M_GEMV_MAX_OUT`` output rows run 2-8 activation rows through the
+#: plugin's one-CTA-per-row kernel instead of cuBLAS, which picks a slow
+#: tensor-core tile for Bonsai's [96, 5120] BF16 in_proj_ba there. Default off.
+_SMALL_M_GEMV = os.environ.get("VLLM_GGUF_SMALL_M_GEMV", "0") == "1"
+_SMALL_M_GEMV_MAX_OUT = 1024
 
 #: ``VLLM_GGUF_PTQ1_0_PLANAR``: ``auto`` (default) re-lays every PTQ1_0 weight
 #: whose rows hold a multiple of 4 blocks out into per-row planes at load time
@@ -151,6 +160,15 @@ def _fused_mul_mat_gguf(
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type in UNQUANTIZED_TYPES:
+        if (
+            _SMALL_M_GEMV
+            and 2 <= x.shape[0] <= 8
+            and weight.shape[0] <= _SMALL_M_GEMV_MAX_OUT
+            and x.dtype == weight.dtype
+            and x.shape[1] % 8 == 0
+            and ops.small_m_gemv_available()
+        ):
+            return ops.small_m_gemv(weight, x.contiguous())
         return x @ weight.T
     if weight_type == PTQ1_0_PLANAR:
         # same tiers as GGML-order PTQ1_0; every kernel reads the planar rows

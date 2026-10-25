@@ -357,6 +357,7 @@ def bench_small_m(results, reps=200):
         ref = (x.float() @ w.float().T)
         variants = {
             "x@w.T": lambda: x @ w.T,
+            "plugin small_m_gemv": (lambda: ops.small_m_gemv(w, x)) if m >= 2 else (lambda: x @ w.T),
             "(w@x.T).T.contig": lambda: (w @ x.T).T.contiguous(),
             "per-row mv": lambda: torch.stack([torch.mv(w, x[i]) for i in range(m)]),
             "bmm-rows": lambda: torch.bmm(w.unsqueeze(0).expand(m, -1, -1), x.unsqueeze(-1)).squeeze(-1),
@@ -364,6 +365,8 @@ def bench_small_m(results, reps=200):
         for name, fn in variants.items():
             out = fn()
             err = ((out.float() - ref).abs().max() / ref.abs().max()).item()
+            if name == "plugin small_m_gemv" and m >= 2:
+                expect(f"small_m_gemv m={m} vs fp32", err <= 1e-2, f"max rel err {err:.2e}")
             us = _time_graph(lambda i, fn=fn: fn(), reps, 3)
             results.append({"bench": "small_m", "m": m, "variant": name, "us": us, "max_rel_err": err})
             print(f"in_proj_ba m={m} {name:18s} {us:7.2f} us max rel err {err:.2e}", flush=True)
