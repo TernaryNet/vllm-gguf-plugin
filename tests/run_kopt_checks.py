@@ -388,6 +388,8 @@ def bench_small_m(results, reps=200):
 
 
 def main():
+    # Hadacore is opt-in in the plugin; the checks compare it, so enable it here
+    os.environ.setdefault("VLLM_GGUF_HADACORE", "auto")
     parser = argparse.ArgumentParser()
     parser.add_argument("--hadamard", action="store_true")
     parser.add_argument("--planar", action="store_true")
