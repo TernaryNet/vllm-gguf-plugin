@@ -8,6 +8,7 @@ import torch
 from gguf import GGMLQuantizationType as WeightType
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
+    UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -61,6 +62,20 @@ _SMALL_M_GEMV_MAX_OUT = 1024
 # L40S, [96, 5120]: 2.8-3.7 us at 2-4 rows vs cuBLAS 27.5; at 8 rows cuBLAS picks
 # a good kernel (5.1 vs 5.8 us), 5-7 rows unmeasured
 _SMALL_M_GEMV_MAX_ROWS = 4
+
+def _small_m_gemv_fits(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Static (trace-time) conditions for the small-M kernel; rows are checked at run time."""
+    return (
+        _SMALL_M_GEMV
+        and x.dim() == 2
+        and weight.dim() == 2
+        and weight.shape[0] <= _SMALL_M_GEMV_MAX_OUT
+        and x.dtype == weight.dtype
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.shape[1] % 8 == 0
+        and ops.small_m_gemv_available()
+    )
+
 
 #: ``VLLM_GGUF_PTQ1_0_PLANAR``: ``auto`` (default) re-lays every PTQ1_0 weight
 #: whose rows hold a multiple of 4 blocks out into per-row planes at load time
@@ -163,14 +178,7 @@ def _fused_mul_mat_gguf(
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type in UNQUANTIZED_TYPES:
-        if (
-            _SMALL_M_GEMV
-            and 2 <= x.shape[0] <= _SMALL_M_GEMV_MAX_ROWS
-            and weight.shape[0] <= _SMALL_M_GEMV_MAX_OUT
-            and x.dtype == weight.dtype
-            and x.shape[1] % 8 == 0
-            and ops.small_m_gemv_available()
-        ):
+        if _small_m_gemv_fits(x, weight) and 2 <= x.shape[0] <= _SMALL_M_GEMV_MAX_ROWS:
             return ops.small_m_gemv(weight, x.contiguous())
         return x @ weight.T
     if weight_type == PTQ1_0_PLANAR:
@@ -269,6 +277,41 @@ direct_register_custom_op(
     op_func=_fused_rot_mul_mat_gguf,
     fake_impl=_fused_rot_mul_mat_gguf_fake,
 )
+
+
+def _gguf_small_m_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if 2 <= x.shape[0] <= _SMALL_M_GEMV_MAX_ROWS:
+        return ops.small_m_gemv(weight, x.contiguous())
+    return torch.nn.functional.linear(x, weight)
+
+
+def _gguf_small_m_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="_gguf_small_m_linear",
+    op_func=_gguf_small_m_linear,
+    fake_impl=_gguf_small_m_linear_fake,
+)
+
+
+class GGUFUnquantizedLinearMethod(UnquantizedLinearMethod):
+    """vLLM's unquantized linear (the BF16 / F16 / F32 tensors of a GGUF file),
+    except that short weights -- Bonsai's [96, 5120] GDN ``in_proj_ba`` -- run
+    2-4 activation rows through the plugin's small-M kernel when
+    ``VLLM_GGUF_SMALL_M_GEMV=1``: cuBLAS takes ~27-36 us there on an L40S, the
+    kernel ~3 us. Other row counts take ``F.linear`` inside the same op."""
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if bias is None and _small_m_gemv_fits(x, layer.weight):
+            return torch.ops.vllm._gguf_small_m_linear(x, layer.weight)
+        return super().apply(layer, x, bias)
 
 
 @register_weight_loader_v2_supported_method
