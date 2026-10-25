@@ -50,8 +50,9 @@ _PRISM_TRITON_GEMM_MAX_ROWS = 256
 _PRISM_DEQUANT_ROW_CHUNK = 16384
 
 #: ``VLLM_GGUF_PTQ1_0_MMA``: ``1`` (default) runs PTQ1_0 linears with at least
-#: ``VLLM_GGUF_PTQ1_0_MMA_MIN_ROWS`` activation rows (default 257, i.e. what
-#: took dequantize + cuBLAS) through the int8 tensor-core GEMM
+#: ``VLLM_GGUF_PTQ1_0_MMA_MIN_ROWS`` activation rows (default 64: from there
+#: it beats the Triton tier 2.4-3x on L40S and L4, and dequantize + cuBLAS at
+#: every measured M up to 2048) through the int8 tensor-core GEMM
 #: (``ggml_mul_mat_ptq1_0_mma``) when the build has it and the shape fits
 #: (K % 512 == 0, N % 128 == 0); ``0`` keeps dequantize + cuBLAS. Its Q8
 #: activations and fp32 sums are the Triton tier's, bit for bit, so prefill
@@ -60,7 +61,7 @@ _PRISM_DEQUANT_ROW_CHUNK = 16384
 #: custom op at run time, so it never enters a compiled graph.
 PTQ1_0_MMA_ENV = "VLLM_GGUF_PTQ1_0_MMA"
 _PTQ1_0_MMA = os.environ.get(PTQ1_0_MMA_ENV, "1") == "1"
-_PTQ1_0_MMA_MIN_ROWS = int(os.environ.get("VLLM_GGUF_PTQ1_0_MMA_MIN_ROWS", "257"))
+_PTQ1_0_MMA_MIN_ROWS = int(os.environ.get("VLLM_GGUF_PTQ1_0_MMA_MIN_ROWS", "64"))
 _PTQ1_0_MMA_VARIANT = int(os.environ.get("VLLM_GGUF_PTQ1_0_MMA_VARIANT", "-1"))
 
 

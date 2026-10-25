@@ -253,6 +253,10 @@ Tensor ggml_mul_mat_vec_ptq1_0(Tensor W,  // quant weight
   return Y;
 }
 
+static inline int device_idx_for_sms(const Tensor& X) {
+  return X.get_device_index();
+}
+
 // PTQ1_0 GEMM on int8 tensor cores for prefill-sized batches (see ptq1_0_mma.cuh): X is
 // quantized to Q8 per 32 elements exactly like the Triton tier, so Y is bit-identical to it.
 // variant selects the tile configuration (bench); -1 = default.
@@ -265,7 +269,12 @@ Tensor ggml_mul_mat_ptq1_0_mma(Tensor W,  // quant weight
   STD_TORCH_CHECK(W.sizes()[1] == col / QK_PTQ1_0 * (int64_t)sizeof(block_ptq1_0),
                   "ggml_mul_mat_ptq1_0_mma: weight row size does not match K");
   STD_TORCH_CHECK(W.sizes()[0] >= row, "ggml_mul_mat_ptq1_0_mma: weight has fewer rows than row");
-  const int v = variant < 0 ? 0 : (int)variant;
+  static int sm_count = 0;
+  if (sm_count == 0) {
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_idx_for_sms(X));
+  }
+  const int v = variant < 0 ? ptq1_0_mma::choose_variant((int)vecs, (int)row, sm_count)
+                            : (int)variant;
   STD_TORCH_CHECK((v & 255) < PTQ1_0_MMA_NUM_VARIANTS, "ggml_mul_mat_ptq1_0_mma: unknown variant");
   const int group = ptq1_0_mma::variant_group(v);
   STD_TORCH_CHECK(row % ptq1_0_mma::variant_bn(v & 255) == 0,

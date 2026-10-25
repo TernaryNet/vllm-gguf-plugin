@@ -602,6 +602,17 @@ using Cfg4 = Config<64, 128, 1, 4, 3>;
 
 static inline int variant_bn(const int variant) { (void) variant; return 128; }
 
+// Default tile choice (measured on L40S and L4, Bonsai shapes): the 64-row tile (3) up to 64 rows
+// and whenever the 128 x 128 grid would leave more than half the SMs idle (K = 17408 / N = 5120
+// at small M); the 128 x 128 tile with 64 x 32 warp tiles (0) otherwise.
+static inline int choose_variant(const int M, const int N, const int sms) {
+    if (M <= 64) {
+        return 3;
+    }
+    const long ctas = (long) ((M + 127) / 128) * (N / 128);
+    return 2 * ctas < sms ? 3 : 0;
+}
+
 template <typename out_t, typename Cfg>
 static void launch_gemm(const int8_t * q, const half * dq, const uint8_t * w, out_t * y, const int M, const int N,
                         const int K, cudaStream_t stream, const int ablate) {

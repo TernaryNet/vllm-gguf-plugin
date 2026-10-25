@@ -52,7 +52,7 @@ def random_ptq1_0(n, k, seed=0, device="cuda"):
 
 
 def variant_fits(variant, n):
-    return n % (256 if variant % 16 == 4 else 128) == 0
+    return n % 128 == 0
 
 
 def check(args, report):
@@ -182,7 +182,7 @@ def bench(args, report):
                         weights,
                         iters,
                     )
-            t32 = [row[f"mma{v}_ms"] for v in variants if v < 16 and f"mma{v}_ms" in row]
+            t32 = [row[f"mma{v}_ms"] for v in variants if v < 16 and v != -1 and f"mma{v}_ms" in row]
             t128 = [row[f"mma{v}_ms"] for v in variants if v >= 16 and f"mma{v}_ms" in row]
             best = min(t32) if t32 else float("nan")
             best128 = min(t128) if t128 else float("nan")
@@ -205,11 +205,14 @@ def main():
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--shapes", default="gate_up,qkvz,down,out")
     parser.add_argument("--rows", default="128,256,257,512,1024,2048")
+    parser.add_argument("--auto", action="store_true", help="also time the default (auto) tile choice, variant -1")
     parser.add_argument("--variants", default="0,1,2,3,4")
     parser.add_argument("--no-old", action="store_true", help="skip the dequant + cuBLAS and Triton timings")
     parser.add_argument("--json")
     args = parser.parse_args()
     args.variants = [int(v) for v in args.variants.split(",")]
+    if args.auto:
+        args.variants = args.variants + [-1]
     if not ops.ptq1_0_mma_available():
         print("REFUSED: ggml_mul_mat_ptq1_0_mma not in this build", file=sys.stderr)
         return 2
