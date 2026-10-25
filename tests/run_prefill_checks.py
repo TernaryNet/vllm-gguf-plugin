@@ -201,6 +201,17 @@ def bench(args, report):
                 return ggml_gemm_ptq1_0_triton(w, x, n)
 
             row = {"shape": name, "n": n, "k": k, "m": m}
+            if args.matvec and m <= 16:
+                # the decode tiers at the same rows: GGML-order mat-vec, K's planar mat-vec,
+                # and the mma kernel on planar weights
+                planar = [repack_ptq1_0_planar(wt.clone()) for wt in weights]
+                xc = x.contiguous()
+                row["mmv_ms"] = bench_ms(lambda w: ops.ggml_mul_mat_vec_ptq1_0(w, xc, n), weights, iters)
+                row["mmv_planar_ms"] = bench_ms(
+                    lambda w: ops.ggml_mul_mat_vec_ptq1_0_planar(w, xc, n), planar, iters)
+                row["mma_planar_ms"] = bench_ms(
+                    lambda w: ops.ggml_mul_mat_ptq1_0_mma(w, xc, n, -1, True), planar, iters)
+                del planar
             row["old_ms"] = bench_ms(old, weights, iters) if not args.no_old else float("nan")
             row["triton_ms"] = bench_ms(tri, weights, iters) if m <= 512 and not args.no_old else None
             for v in variants:
@@ -222,6 +233,8 @@ def bench(args, report):
             cells = [f"{row['old_ms']:.3f}", "-" if row["triton_ms"] is None else f"{row['triton_ms']:.3f}"]
             cells += [f"{row[f'mma{v}_ms']:.3f}" if f"mma{v}_ms" in row else "-" for v in variants]
             print(f"| {name} | {m} | " + " | ".join(cells) + f" | {row['best_mma_tops']:.0f} | {row['best_over_old']:.2f} | {row['best128_over_old']:.2f} |", flush=True)
+            if "mmv_ms" in row:
+                print(f"|   mat-vec GGML {row['mmv_ms']:.3f} ms, planar {row['mmv_planar_ms']:.3f} ms; mma planar {row['mma_planar_ms']:.3f} ms |", flush=True)
         del weights, base
         torch.cuda.empty_cache()
     report["bench"] = results
@@ -236,6 +249,7 @@ def main():
     parser.add_argument("--auto", action="store_true", help="also time the default (auto) tile choice, variant -1")
     parser.add_argument("--variants", default="0,1,2,3,4")
     parser.add_argument("--no-old", action="store_true", help="skip the dequant + cuBLAS and Triton timings")
+    parser.add_argument("--matvec", action="store_true", help="also time the mat-vec tiers at <= 16 rows")
     parser.add_argument("--json")
     args = parser.parse_args()
     args.variants = [int(v) for v in args.variants.split(",")]
