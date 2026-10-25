@@ -68,6 +68,7 @@ def _small_m_gemv_fits(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Static (trace-time) conditions for the small-M kernel; rows are checked at run time."""
     return (
         _SMALL_M_GEMV
+        and x.is_cuda
         and x.dim() == 2
         and weight.dim() == 2
         and weight.shape[0] <= _SMALL_M_GEMV_MAX_OUT
@@ -431,6 +432,7 @@ class GGUFLinearMethod(LinearMethodBase):
         }
         usable = (
             ops.fused_rot_available()
+            and layer.weight.is_cuda
             and layout.forward
             and layout.block_size == 1024
             and torch.float32 in layout._signs
@@ -555,7 +557,10 @@ class GGUFLinearMethod(LinearMethodBase):
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             # signs + FWHT + Q8 quantize + mat-vec in the op (1-8 rows); the
-            # dense rotation + regular tiers above 8 rows
+            # dense rotation + regular tiers above 8 rows. Under TP the full
+            # width arrives for column-parallel layers and in gather mode
+            # (tp.py all-gathers first); a block-aligned row-parallel shard is
+            # narrower than the layout and takes input_to_gguf's local signs.
             layout, weight_type = fused
             out = torch.ops.vllm._fused_rot_mul_mat_gguf(
                 x,
