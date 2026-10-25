@@ -163,5 +163,5 @@ def test_ptq1_0_mma_matches_triton_tier(num_tokens: int, hidden_size: int, dtype
         torch.testing.assert_close(out, tri, atol=0, rtol=0)
         out = ops.ggml_mul_mat_ptq1_0_mma(planar, x, 256, variant, True)
         torch.testing.assert_close(out, tri, atol=0, rtol=0)
-    ref = x @ dense.to(dtype).T
-    torch.testing.assert_close(tri, ref, atol=0.5, rtol=2e-2)
+    # (the Triton tier against a dense reference is test_ptq1_0_gemm_triton's job)
+    del dense
