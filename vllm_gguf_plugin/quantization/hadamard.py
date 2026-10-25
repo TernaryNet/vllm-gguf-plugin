@@ -50,36 +50,74 @@ HADAMARD_COMPUTE_DTYPE = torch.float32
 _LAYOUT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
-def _hadacore_op():
-    """vLLM's Hadacore FWHT kernel (x @ H / sqrt(n), Sylvester order), if built.
+#: ``VLLM_GGUF_HADACORE`` selects how the blockwise rotation runs on CUDA for
+#: bf16 / fp16 activations: ``auto`` (default) uses vLLM's Hadacore FWHT kernel
+#: when the vLLM build has it and the dense ``x @ H`` GEMM otherwise, ``1``
+#: requires Hadacore (refuses to prepare without it), ``0`` forces the dense
+#: GEMM. fp32 activations and CPU tensors always take the dense path.
+HADACORE_ENV = "VLLM_GGUF_HADACORE"
+#: Largest transform the Hadacore kernel implements.
+_HADACORE_MAX_BLOCK = 1 << 15
+_HADACORE_DTYPES = (torch.float16, torch.bfloat16)
+_HADACORE_LOGGED: set[str] = set()
 
-    Scratch-branch experiment: replaces the dense ``x @ H`` GEMM per folded
-    linear (8-36 us on an L40S) with a ~1-2 us tensor-core FWHT. Disabled with
-    VLLM_GGUF_HADACORE=0.
-    """
+
+def _hadacore_mode() -> str:
     import os
 
-    if os.environ.get("VLLM_GGUF_HADACORE", "1") != "1":
-        return None
-    try:
-        from vllm import _custom_ops
-    except ImportError:
-        return None
-    if not hasattr(torch.ops, "_C") or not hasattr(torch.ops._C, "hadacore_transform"):
-        return None
-    return _custom_ops.hadacore_transform
+    mode = os.environ.get(HADACORE_ENV, "auto").strip().lower()
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"{HADACORE_ENV} must be auto, 0 or 1, got {mode!r}")
+    return mode
 
 
-_HADACORE = None
-_HADACORE_RESOLVED = False
+def resolve_hadacore(block_size: int):
+    """Return vLLM's Hadacore op for a *block_size* rotation, or ``None``.
 
+    The op computes ``x @ H / sqrt(n)`` in Sylvester order along the last
+    dimension -- exactly :func:`hadamard_matrix`'s ``H`` -- with per-stage
+    scales that are exact for every power of four and for 2 x a power of four
+    (1024 = 16 x 16 x 4: 1/4, 1/4, 1/2). For bf16 it multiplies on tensor cores
+    with fp32 accumulation and rounds to bf16 after each of its stages (three
+    for 1024), where the dense GEMM rounds once: results agree to about one
+    bf16 ulp. Resolved once, outside the traced forward; importing
+    ``vllm._custom_ops`` also registers the op's fake implementation.
+    """
+    mode = _hadacore_mode()
+    if mode == "0":
+        reason = f"{HADACORE_ENV}=0"
+        op = None
+    elif block_size <= 0 or block_size & (block_size - 1) or block_size > _HADACORE_MAX_BLOCK:
+        reason = f"block size {block_size} is outside Hadacore's power-of-two range"
+        op = None
+    else:
+        try:
+            # registers the op's fake implementation for torch.compile
+            import vllm._custom_ops  # noqa: F401
+        except ImportError:
+            pass
+        op = getattr(getattr(torch.ops, "_C", None), "hadacore_transform", None)
+        reason = "vLLM build without _C.hadacore_transform" if op is None else ""
+    if op is None and mode == "1":
+        raise RuntimeError(f"{HADACORE_ENV}=1 but the Hadacore rotation is unavailable: {reason}")
+    from vllm.logger import init_logger
 
-def _get_hadacore():
-    global _HADACORE, _HADACORE_RESOLVED
-    if not _HADACORE_RESOLVED:
-        _HADACORE = _hadacore_op()
-        _HADACORE_RESOLVED = True
-    return _HADACORE
+    key = "hadacore" if op is not None else f"dense:{reason}"
+    if key not in _HADACORE_LOGGED:
+        _HADACORE_LOGGED.add(key)
+        if op is not None:
+            init_logger(__name__).info(
+                "prism.hadamard: rotating bf16/fp16 activations with vLLM's "
+                "Hadacore FWHT (block %d; %s=0 restores the dense GEMM)",
+                block_size,
+                HADACORE_ENV,
+            )
+        else:
+            init_logger(__name__).info(
+                "prism.hadamard: rotating activations with the dense x @ H GEMM (%s)",
+                reason,
+            )
+    return op
 
 
 @dataclass(frozen=True, eq=False)
@@ -354,6 +392,7 @@ class GGUFHadamardLayout:
         self._matrices: dict[torch.dtype, torch.Tensor] = {}
         self._signs: dict[torch.dtype, torch.Tensor] = {}
         self._tp_rank = 0
+        self._hadacore = None
 
     def __repr__(self) -> str:
         return (
@@ -384,6 +423,7 @@ class GGUFHadamardLayout:
         except (ImportError, AssertionError):
             # not running inside an initialized vLLM worker (unit tests)
             self._tp_rank = 0
+        self._hadacore = resolve_hadacore(self.block_size) if device.type == "cuda" else None
         self._device = device
 
     def _local_signs(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
@@ -416,9 +456,11 @@ class GGUFHadamardLayout:
         out = x.to(dtype)
         if not inverse and signs is not None:
             out = out * signs
-        hadacore = _get_hadacore() if out.is_cuda and dtype in (torch.float16, torch.bfloat16) else None
-        if hadacore is not None and self.block_size <= (1 << 15):
-            out = hadacore(out.reshape(-1, self.block_size).contiguous(), False).reshape(x.shape)
+        if self._hadacore is not None and dtype in _HADACORE_DTYPES:
+            # out of place: x itself may be the caller's tensor when no sign
+            # multiply made a copy
+            blocks = out.reshape(-1, self.block_size).contiguous()
+            out = self._hadacore(blocks, False).reshape(x.shape)
         else:
             out = (out.reshape(-1, self.block_size) @ matrix).reshape(x.shape)
         if inverse and signs is not None:
