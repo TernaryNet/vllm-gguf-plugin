@@ -217,27 +217,28 @@ def _fused_mul_mat_gguf(
             return ops.small_m_gemv(weight, x.contiguous())
         return x @ weight.T
     if weight_type == PTQ1_0_PLANAR:
-        # same tiers as GGML-order PTQ1_0; every kernel reads the planar rows
-        if x.shape[0] <= _PRISM_MMV_MAX_ROWS:
-            return ops.ggml_mul_mat_vec_ptq1_0_planar(
-                weight, x.contiguous(), weight.shape[0]
-            )
+        # same tiers as GGML-order PTQ1_0; every kernel reads the planar rows. The mma tier
+        # is asked first so a MIN_ROWS below 9 really takes it (default 9: no change)
         if _ptq1_0_mma_fits(x, weight):
             return ops.ggml_mul_mat_ptq1_0_mma(
                 weight, x.contiguous(), weight.shape[0], _PTQ1_0_MMA_VARIANT, True
+            )
+        if x.shape[0] <= _PRISM_MMV_MAX_ROWS:
+            return ops.ggml_mul_mat_vec_ptq1_0_planar(
+                weight, x.contiguous(), weight.shape[0]
             )
         if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
             return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
         return _dequant_matmul(x, weight, weight_type)
     if weight_type in PRISM_TERNARY_TYPES:
-        if x.shape[0] <= _PRISM_MMV_MAX_ROWS and ops.ptq1_0_mmv_available():
-            return ops.ggml_mul_mat_vec_ptq1_0(weight, x, weight.shape[0])
-        if x.shape[0] <= _PRISM_MMVQ_MAX_ROWS:
-            return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
         if _ptq1_0_mma_fits(x, weight):
             return ops.ggml_mul_mat_ptq1_0_mma(
                 weight, x.contiguous(), weight.shape[0], _PTQ1_0_MMA_VARIANT, False
             )
+        if x.shape[0] <= _PRISM_MMV_MAX_ROWS and ops.ptq1_0_mmv_available():
+            return ops.ggml_mul_mat_vec_ptq1_0(weight, x, weight.shape[0])
+        if x.shape[0] <= _PRISM_MMVQ_MAX_ROWS:
+            return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
         if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
             return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
         return _dequant_matmul(x, weight, weight_type)
@@ -296,7 +297,7 @@ def _fused_rot_mul_mat_gguf(
 ) -> torch.Tensor:
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
-    if x.shape[0] <= _PRISM_MMV_MAX_ROWS:
+    if x.shape[0] <= _PRISM_MMV_MAX_ROWS and not _ptq1_0_mma_fits(x, weight):
         return ops.ggml_mul_mat_vec_ptq1_0_rot(
             weight, x.contiguous(), signs_f32, weight.shape[0], weight_type == PTQ1_0_PLANAR
         )
