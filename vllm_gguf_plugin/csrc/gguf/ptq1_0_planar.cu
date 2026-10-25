@@ -51,42 +51,52 @@ static inline cudaStream_t ptq1_0_planar_stream(int32_t device_index) {
   return static_cast<cudaStream_t>(raw_stream);
 }
 
+// One base-3 digit step on four bytes held as [b0, 0, b1, 0] / [b2, 0, b3, 0]:
+// the digits of b0..b3 as four bytes, remainders advanced -- the arithmetic of
+// ptq1_0_digits4 (vecdotq.cuh), with the byte gather as one PRMT instead of
+// the shift/mask chain nvcc emits for it (same digits, so same results).
+static __device__ __forceinline__ int ptq1_0_digits4_prmt(uint32_t & v_lo, uint32_t & v_hi) {
+  const uint32_t w_lo = v_lo * 3u;
+  const uint32_t w_hi = v_hi * 3u;
+  v_lo = w_lo & 0x00FF00FFu;
+  v_hi = w_hi & 0x00FF00FFu;
+  return (int) __byte_perm(w_lo, w_hi, 0x7531);  // bytes 1, 3 of w_lo, then of w_hi
+}
+
 // The GGML-order decode of ptq1_0_pt.cuh, fed from registers: word g of
 // qs[0:16] is a.{x,y,z,w}, word g of qs[16:24] is b.{x,y}, c holds qh[0],
-// qh[1] in its low bytes and d in its high half.
+// qh[1] in its low bytes and d in its high half. dig[w] holds the digits
+// {0,1,2} of elements 4w .. 4w+3.
 static __device__ __forceinline__ void ptq1_0_decode_planar(const uint4 a, const uint2 b, const uint32_t c,
                                                             int (&dig)[32]) {
   const uint32_t w16[4] = {a.x, a.y, a.z, a.w};
 #pragma unroll
   for (int g = 0; g < 4; ++g) {
-    const uint32_t packed = w16[g];
-    uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
-    uint32_t v_hi = ((packed >> 16) & 0xFF) | ((packed >> 24) << 16);
+    uint32_t v_lo = __byte_perm(w16[g], 0, 0x4140);  // [b0, 0, b1, 0]
+    uint32_t v_hi = __byte_perm(w16[g], 0, 0x4342);  // [b2, 0, b3, 0]
 #pragma unroll
     for (int n = 0; n < 5; ++n) {
-      dig[4 * n + g] = ptq1_0_digits4(v_lo, v_hi);  // element 16n + 4g
+      dig[4 * n + g] = ptq1_0_digits4_prmt(v_lo, v_hi);  // element 16n + 4g
     }
   }
   const uint32_t w8[2] = {b.x, b.y};
 #pragma unroll
   for (int g = 0; g < 2; ++g) {
-    const uint32_t packed = w8[g];
-    uint32_t v_lo = (packed & 0xFF) | ((packed & 0xFF00) << 8);
-    uint32_t v_hi = ((packed >> 16) & 0xFF) | ((packed >> 24) << 16);
+    uint32_t v_lo = __byte_perm(w8[g], 0, 0x4140);
+    uint32_t v_hi = __byte_perm(w8[g], 0, 0x4342);
 #pragma unroll
     for (int n = 0; n < 5; ++n) {
-      dig[20 + 2 * n + g] = ptq1_0_digits4(v_lo, v_hi);  // element 80 + 8n + 4g
+      dig[20 + 2 * n + g] = ptq1_0_digits4_prmt(v_lo, v_hi);  // element 80 + 8n + 4g
     }
   }
-  uint32_t v = (c & 0xFF) | ((c & 0xFF00) << 8);
+  uint32_t v = __byte_perm(c, 0, 0x4140);  // [qh0, 0, qh1, 0]
 #pragma unroll
   for (int n = 0; n < 4; n += 2) {
-    const uint32_t w0 = v * 3;
-    v = w0 & 0x00FF00FF;
-    const uint32_t w1 = v * 3;
-    v = w1 & 0x00FF00FF;
-    dig[30 + n / 2] = (int) (((w0 >> 8) & 0xFF) | (((w0 >> 24) & 0xFF) << 8) |
-                             (((w1 >> 8) & 0xFF) << 16) | ((w1 >> 24) << 24));  // element 120 + 2n
+    const uint32_t w0 = v * 3u;
+    v = w0 & 0x00FF00FFu;
+    const uint32_t w1 = v * 3u;
+    v = w1 & 0x00FF00FFu;
+    dig[30 + n / 2] = (int) __byte_perm(w0, w1, 0x7531);  // element 120 + 2n
   }
 }
 
