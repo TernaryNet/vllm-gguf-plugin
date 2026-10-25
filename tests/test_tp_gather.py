@@ -63,8 +63,13 @@ def _layout(width, seed):
 
 
 def _patch_rank(monkeypatch, rank, size):
-    monkeypatch.setattr(params_mod, "get_tensor_model_parallel_rank", lambda: rank)
-    monkeypatch.setattr(params_mod, "get_tensor_model_parallel_world_size", lambda: size)
+    from vllm.model_executor import parameter as vllm_parameter
+
+    for module in (params_mod, vllm_parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: size
+        )
 
 
 def _load(method, layer, packed, k, n):
