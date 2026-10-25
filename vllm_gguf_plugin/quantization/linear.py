@@ -58,6 +58,9 @@ _PRISM_DEQUANT_ROW_CHUNK = 16384
 #: tensor-core tile for Bonsai's [96, 5120] BF16 in_proj_ba there. Default off.
 _SMALL_M_GEMV = os.environ.get("VLLM_GGUF_SMALL_M_GEMV", "0") == "1"
 _SMALL_M_GEMV_MAX_OUT = 1024
+# L40S, [96, 5120]: 2.8-3.7 us at 2-4 rows vs cuBLAS 27.5; at 8 rows cuBLAS picks
+# a good kernel (5.1 vs 5.8 us), 5-7 rows unmeasured
+_SMALL_M_GEMV_MAX_ROWS = 4
 
 #: ``VLLM_GGUF_PTQ1_0_PLANAR``: ``auto`` (default) re-lays every PTQ1_0 weight
 #: whose rows hold a multiple of 4 blocks out into per-row planes at load time
@@ -162,7 +165,7 @@ def _fused_mul_mat_gguf(
     if weight_type in UNQUANTIZED_TYPES:
         if (
             _SMALL_M_GEMV
-            and 2 <= x.shape[0] <= 8
+            and 2 <= x.shape[0] <= _SMALL_M_GEMV_MAX_ROWS
             and weight.shape[0] <= _SMALL_M_GEMV_MAX_OUT
             and x.dtype == weight.dtype
             and x.shape[1] % 8 == 0

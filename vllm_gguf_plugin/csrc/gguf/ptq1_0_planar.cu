@@ -281,16 +281,33 @@ static void run_ptq1_0_planar(const int64_t ncols_q, const int variant, const vo
   }
 }
 
-// Lanes per row when the caller passes 0. Placeholder until the micro-bench
-// on the 27B shapes picks per-shape values (see tests/run_kopt_checks.py).
-static int ptq1_0_planar_auto_lpr(const int nb, const int ncols_q) {
-  if (ncols_q >= 16) {
-    return 32;  // keeps the 16-column accumulators in registers
+// Variant when the caller passes 0, from the L40S micro-bench of the 27B shapes
+// (tests/run_kopt_checks.py --bench, 2026-10-25, quantize included; us):
+//   1 col:  gate_up 55.6 (1032), qkvz 29.9 (1032), attn_qkv 23.1 (16), o 13.0 (16),
+//           down 32.6 (32), head 400.9 (1032)  -- GGML kernel 59.8 / 33.8 / 26.9 / 13.9 / 33.6 / 394.9
+//   2 cols: gate_up 56.0 (1032), qkvz 30.2 (1032), attn_qkv 24.8 (32), o 14.0 (32), down 34.3 (32),
+//           head 383.1 (1032)
+//   4 cols: gate_up 63.1 (1016), qkvz 35.4 (32), attn_qkv 30.8 (32), o 16.8 (32), down 43.1 (32),
+//           head 395.8 (1016)
+//   8 cols: gate_up 86.9 (16), qkvz 46.8 (16), attn_qkv 41.0 (16), o 24.4 (1032), down 61.3 (8),
+//           head 478.7 (8)                     -- GGML kernel 113.2 / 58.9 / 52.2 / 26.5 / 76.4 / 793.9
+static int ptq1_0_planar_auto_variant(const int nb, const int nrows, const int ncols_q) {
+  const bool long_rows = nb >= 100;  // ffn_down, K = 17408
+  switch (ncols_q) {
+    case 1:
+      if (long_rows) return 32;
+      return nrows >= 16384 ? 1032 : 16;
+    case 2:
+      if (long_rows) return 32;
+      return nrows >= 16384 ? 1032 : 32;
+    case 4:
+      return (!long_rows && nrows >= 32768) ? 1016 : 32;
+    case 8:
+      if (long_rows || nrows >= 100000) return 8;
+      return nrows >= 8192 ? 16 : 1032;
+    default:
+      return 32;  // 16 columns: keeps the accumulators in registers
   }
-  if (nb % 8 == 0 && nb <= 64) {
-    return 8;
-  }
-  return 16;
 }
 
 // Y[vecs, row] = X[vecs, K] @ W^T for a planar PTQ1_0 W, vecs <= 16;
@@ -315,7 +332,7 @@ Tensor ggml_mul_mat_vec_ptq1_0_planar(Tensor W, Tensor X, int64_t row, int64_t l
   cudaStream_t stream = ptq1_0_planar_stream(device_idx);
   const int nblk = ptq1_0_pt_nblk(col);
   const int64_t ncols_q = ptq1_0_pt_ncols(vecs);
-  const int lpr = lanes_per_row ? (int) lanes_per_row : ptq1_0_planar_auto_lpr((int) nb, (int) ncols_q);
+  const int lpr = lanes_per_row ? (int) lanes_per_row : ptq1_0_planar_auto_variant((int) nb, (int) row, (int) ncols_q);
   Tensor quant_X = torch::stable::new_empty(W, {ncols_q, (int64_t) PTQ1_0_PT_PLANES * nblk * 4}, ScalarType::Int);
   Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
   const int inb = (int) nb, irow = (int) row, ivecs = (int) vecs;
@@ -571,7 +588,7 @@ Tensor ggml_mul_mat_vec_ptq1_0_rot(Tensor W, Tensor X, Tensor signs, int64_t row
   cudaStream_t stream = ptq1_0_planar_stream(device_idx);
   const int nblk = ptq1_0_pt_nblk(col);
   const int64_t ncols_q = ptq1_0_pt_ncols(vecs);
-  const int lpr = ncols_q >= 16 ? 32 : ptq1_0_planar_auto_lpr((int) nb, (int) ncols_q);
+  const int lpr = ptq1_0_planar_auto_variant((int) nb, (int) row, (int) ncols_q);
   Tensor quant_X = torch::stable::new_empty(W, {ncols_q, (int64_t) PTQ1_0_PT_PLANES * nblk * 4}, ScalarType::Int);
   Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
   const int inb = (int) nb, irow = (int) row, ivecs = (int) vecs, icol = (int) col;
