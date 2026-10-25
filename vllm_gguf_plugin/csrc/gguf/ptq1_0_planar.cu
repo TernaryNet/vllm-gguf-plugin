@@ -100,10 +100,44 @@ static __device__ __forceinline__ void ptq1_0_decode_planar(const uint4 a, const
   }
 }
 
+// Weight loads that do not allocate in L1 (NA): the weights stream through
+// once, while the Q8 activation planes are re-read by every row of the CTA.
+template <bool NA>
+static __device__ __forceinline__ uint4 ptq1_0_ld16(const uint4 * p) {
+  if constexpr (NA) {
+    uint4 r;
+    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    return r;
+  } else {
+    return __ldg(p);
+  }
+}
+template <bool NA>
+static __device__ __forceinline__ uint2 ptq1_0_ld8(const uint2 * p) {
+  if constexpr (NA) {
+    uint2 r;
+    asm("ld.global.nc.L1::no_allocate.v2.u32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    return r;
+  } else {
+    return __ldg(p);
+  }
+}
+template <bool NA>
+static __device__ __forceinline__ uint32_t ptq1_0_ld4(const uint32_t * p) {
+  if constexpr (NA) {
+    uint32_t r;
+    asm("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(r) : "l"(p));
+    return r;
+  } else {
+    return __ldg(p);
+  }
+}
+
 // PF: load the next group of J blocks before decoding the current one (two
 // groups of weight registers live), so a lane with more than J blocks never
 // waits for DRAM between groups.
-template <typename scalar_t, int NCOLS, int LPR, bool PF>
+template <typename scalar_t, int NCOLS, int LPR, bool PF, bool NA>
 static __global__ void __launch_bounds__(WARP_SIZE_GGUF * PTQ1_0_PLANAR_WARPS)
 mul_mat_vec_ptq1_0_planar_kernel(const uint8_t * __restrict__ vx, const void * __restrict__ vy,
                                  scalar_t * __restrict__ dst, const int nb, const int nrows,
@@ -141,9 +175,9 @@ mul_mat_vec_ptq1_0_planar_kernel(const uint8_t * __restrict__ vx, const void * _
     for (int jj = 0; jj < J; ++jj) {
       const int kb = kb0 + jj * LPR;
       if (kb < nbr) {
-        ga[jj] = __ldg(pa + kb);
-        gb[jj] = __ldg(pb + kb);
-        gc[jj] = __ldg(pc + kb);
+        ga[jj] = ptq1_0_ld16<NA>(pa + kb);
+        gb[jj] = ptq1_0_ld8<NA>(pb + kb);
+        gc[jj] = ptq1_0_ld4<NA>(pc + kb);
       } else {
         ga[jj] = make_uint4(0, 0, 0, 0);
         gb[jj] = make_uint2(0, 0);
@@ -241,17 +275,18 @@ mul_mat_vec_ptq1_0_planar_kernel(const uint8_t * __restrict__ vx, const void * _
 #endif
 }
 
-template <typename scalar_t, int NCOLS, int LPR, bool PF = false>
+template <typename scalar_t, int NCOLS, int LPR, bool PF = false, bool NA = false>
 static void launch_ptq1_0_planar(const void * vx, const void * vy, scalar_t * dst, const int nb,
                                  const int nrows, const int nvecs, const int nblk, cudaStream_t stream) {
   constexpr int rows_per_cta = PTQ1_0_PLANAR_WARPS * (WARP_SIZE_GGUF / LPR);
   const dim3 grid((nrows + rows_per_cta - 1) / rows_per_cta, 1, 1);
   const dim3 block(WARP_SIZE_GGUF * PTQ1_0_PLANAR_WARPS, 1, 1);
-  mul_mat_vec_ptq1_0_planar_kernel<scalar_t, NCOLS, LPR, PF>
+  mul_mat_vec_ptq1_0_planar_kernel<scalar_t, NCOLS, LPR, PF, NA>
       <<<grid, block, 0, stream>>>((const uint8_t *) vx, vy, dst, nb, nrows, nvecs, nblk);
 }
 
-// variant code: lanes per row 8 / 16 / 32, plus 1000 for the prefetching loop
+// variant code: lanes per row 8 / 16 / 32, plus 1000 for the prefetching loop,
+// plus 2000 for L1-bypassing weight loads (2008/2016/2032, 3016/3032)
 template <typename scalar_t, int NCOLS>
 static void launch_ptq1_0_planar_lpr(const int variant, const void * vx, const void * vy, scalar_t * dst,
                                      const int nb, const int nrows, const int nvecs, const int nblk,
@@ -262,6 +297,11 @@ static void launch_ptq1_0_planar_lpr(const int variant, const void * vx, const v
     case 1008: launch_ptq1_0_planar<scalar_t, NCOLS, 8, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
     case 1016: launch_ptq1_0_planar<scalar_t, NCOLS, 16, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
     case 1032: launch_ptq1_0_planar<scalar_t, NCOLS, 32, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 2008: launch_ptq1_0_planar<scalar_t, NCOLS, 8, false, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 2016: launch_ptq1_0_planar<scalar_t, NCOLS, 16, false, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 2032: launch_ptq1_0_planar<scalar_t, NCOLS, 32, false, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 3016: launch_ptq1_0_planar<scalar_t, NCOLS, 16, true, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
+    case 3032: launch_ptq1_0_planar<scalar_t, NCOLS, 32, true, true>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
     default:   launch_ptq1_0_planar<scalar_t, NCOLS, 32>(vx, vy, dst, nb, nrows, nvecs, nblk, stream); break;
   }
 }
@@ -282,29 +322,31 @@ static void run_ptq1_0_planar(const int64_t ncols_q, const int variant, const vo
 }
 
 // Variant when the caller passes 0, from the L40S micro-bench of the 27B shapes
-// (tests/run_kopt_checks.py --bench, 2026-10-25, quantize included; us):
-//   1 col:  gate_up 55.6 (1032), qkvz 29.9 (1032), attn_qkv 23.1 (16), o 13.0 (16),
-//           down 32.6 (32), head 400.9 (1032)  -- GGML kernel 59.8 / 33.8 / 26.9 / 13.9 / 33.6 / 394.9
-//   2 cols: gate_up 56.0 (1032), qkvz 30.2 (1032), attn_qkv 24.8 (32), o 14.0 (32), down 34.3 (32),
-//           head 383.1 (1032)
-//   4 cols: gate_up 63.1 (1016), qkvz 35.4 (32), attn_qkv 30.8 (32), o 16.8 (32), down 43.1 (32),
-//           head 395.8 (1016)
-//   8 cols: gate_up 86.9 (16), qkvz 46.8 (16), attn_qkv 41.0 (16), o 24.4 (1032), down 61.3 (8),
-//           head 478.7 (8)                     -- GGML kernel 113.2 / 58.9 / 52.2 / 26.5 / 76.4 / 793.9
+// (tests/run_kopt_checks.py --bench, l40s-1 2026-10-25, quantize included, us;
+// GGML-order kernel in brackets):
+//   1 col:  gate_up 55.4 [59.8] (3032), qkvz 29.8 [33.8] (3032), attn_qkv 22.9 [26.9] (3032),
+//           o 12.8 [13.9] (2016), down 32.7 [33.6] (2032), head 379.0 [394.9] (3032)
+//   2 cols: gate_up 56.0 [59.9], qkvz 30.4 [32.7], head 369.9 [394.4] (3032); attn_qkv 24.5 [27.8],
+//           o 13.9 [14.7], down 33.9 [33.8] (2032)
+//   4 cols: gate_up 62.8 [72.5], head 385.6 [496.8] (3016); qkvz 35.4 [38.7], attn_qkv 30.5 [33.8],
+//           o 16.8 [18.0], down 39.0 [39.2] (2032)
+//   8 cols: gate_up 85.1 [112.9], qkvz 45.4 [59.0], attn_qkv 39.4 [52.2] (2016); o 23.9 [26.4] (3032);
+//           down 61.6 [76.5], head 487.1 [797.4] (2008)
+// 2000 = weight loads bypass L1 (the activation planes stay resident), 1000 =
+// next group of blocks prefetched; 8 / 16 / 32 = lanes per row.
 static int ptq1_0_planar_auto_variant(const int nb, const int nrows, const int ncols_q) {
   const bool long_rows = nb >= 100;  // ffn_down, K = 17408
   switch (ncols_q) {
     case 1:
-      if (long_rows) return 32;
-      return nrows >= 16384 ? 1032 : 16;
+      if (long_rows) return 2032;
+      return nrows >= 8192 ? 3032 : 2016;
     case 2:
-      if (long_rows) return 32;
-      return nrows >= 16384 ? 1032 : 32;
+      return (!long_rows && nrows >= 16384) ? 3032 : 2032;
     case 4:
-      return (!long_rows && nrows >= 32768) ? 1016 : 32;
+      return (!long_rows && nrows >= 32768) ? 3016 : 2032;
     case 8:
-      if (long_rows || nrows >= 100000) return 8;
-      return nrows >= 8192 ? 16 : 1032;
+      if (long_rows || nrows >= 100000) return 2008;
+      return nrows >= 8192 ? 2016 : 3032;
     default:
       return 32;  // 16 columns: keeps the accumulators in registers
   }
@@ -323,10 +365,10 @@ Tensor ggml_mul_mat_vec_ptq1_0_planar(Tensor W, Tensor X, int64_t row, int64_t l
   STD_TORCH_CHECK(W.dim() == 2 && W.sizes()[0] == row && W.sizes()[1] == nb * 28 && W.is_contiguous(),
                   "planar PTQ1_0 weight must be a contiguous [row, K/128*28] byte tensor");
   STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(W.data_ptr()) % 16 == 0, "planar PTQ1_0 weight must be 16-byte aligned");
-  const int64_t lpr_base = lanes_per_row % 1000;
-  STD_TORCH_CHECK(lanes_per_row == 0 ||
-                      (lanes_per_row < 2000 && (lpr_base == 8 || lpr_base == 16 || lpr_base == 32)),
-                  "lanes_per_row must be 0, 8, 16 or 32 (+1000: prefetching loop)");
+  static const int64_t kVariants[] = {0, 8, 16, 32, 1008, 1016, 1032, 2008, 2016, 2032, 3016, 3032};
+  bool known = false;
+  for (const int64_t v : kVariants) known = known || v == lanes_per_row;
+  STD_TORCH_CHECK(known, "lanes_per_row must be 0 or a variant code 8/16/32 (+1000 prefetch, +2000 L1 bypass)");
   const int32_t device_idx = X.get_device_index();
   const DeviceGuard device_guard(device_idx);
   cudaStream_t stream = ptq1_0_planar_stream(device_idx);

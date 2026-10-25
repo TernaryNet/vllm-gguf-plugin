@@ -51,8 +51,9 @@ SHAPES = {  # name: (output rows, K)
     "lm_head": (248320, 5120),
 }
 FOLDED_WIDTHS = (5120, 6144, 17408)
-# planar mat-vec variants: 0 = auto, lanes per row 8 / 16 / 32, +1000 = prefetching loop
-LPR_VARIANTS = (0, 8, 16, 32, 1008, 1016, 1032)
+# planar mat-vec variants: 0 = auto, lanes per row 8 / 16 / 32, +1000 = prefetching loop,
+# +2000 = L1-bypassing weight loads
+LPR_VARIANTS = (0, 8, 16, 32, 1008, 1016, 1032, 2008, 2016, 2032, 3016, 3032)
 FAILURES = []
 
 
