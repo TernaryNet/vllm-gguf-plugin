@@ -169,6 +169,39 @@ def _dequant_matmul(
         outputs.append(x @ dense.T)
     return torch.cat(outputs, dim=1)
 
+#: ``VLLM_GGUF_PTQ1_0_MMA``: ``1`` (default) runs PTQ1_0 linears with at least
+#: ``VLLM_GGUF_PTQ1_0_MMA_MIN_ROWS`` activation rows (default 9, i.e. every
+#: batch above the mat-vec: per decoder layer it takes 0.88x the Triton tier's
+#: time at 9-16 rows on an L4 and 0.37x at 64, beats dequantize + cuBLAS at
+#: every measured M up to 2048; engine readings: 11k-token prefill x0.78,
+#: 8 / 16-stream MTP decode +13 % / +31 % per stream on an L4, +28 / +43 % on
+#: an L40S) through the int8 tensor-core GEMM
+#: (``ggml_mul_mat_ptq1_0_mma``) when the build has it and the shape fits
+#: (K % 512 == 0, N % 128 == 0); ``0`` keeps dequantize + cuBLAS. Its Q8
+#: activations and fp32 sums are the Triton tier's, bit for bit, so prefill
+#: chunks get the same numerics as batches of 9-256 rows (and the decode
+#: tiers' Q8-per-32 scheme) instead of bf16 activations. Read inside the
+#: custom op at run time, so it never enters a compiled graph.
+PTQ1_0_MMA_ENV = "VLLM_GGUF_PTQ1_0_MMA"
+_PTQ1_0_MMA = os.environ.get(PTQ1_0_MMA_ENV, "1") == "1"
+_PTQ1_0_MMA_MIN_ROWS = int(os.environ.get("VLLM_GGUF_PTQ1_0_MMA_MIN_ROWS", "9"))
+_PTQ1_0_MMA_VARIANT = int(os.environ.get("VLLM_GGUF_PTQ1_0_MMA_VARIANT", "-1"))
+
+
+def _ptq1_0_mma_fits(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """GGML-order and planar PTQ1_0 rows have the same width (28 bytes a block)."""
+    if not (_PTQ1_0_MMA and x.shape[0] >= _PTQ1_0_MMA_MIN_ROWS):
+        return False
+    n_tile = 128
+    block_size, type_size = PTQ1_0_PLANAR_SIZES
+    return (
+        x.dim() == 2
+        and x.shape[1] % 512 == 0
+        and weight.shape[1] == x.shape[1] // block_size * type_size
+        and weight.shape[0] % n_tile == 0
+        and ops.ptq1_0_mma_available()
+    )
+
 
 def _fused_mul_mat_gguf(
     x: torch.Tensor, weight: torch.Tensor, weight_type: int
@@ -189,6 +222,10 @@ def _fused_mul_mat_gguf(
             return ops.ggml_mul_mat_vec_ptq1_0_planar(
                 weight, x.contiguous(), weight.shape[0]
             )
+        if _ptq1_0_mma_fits(x, weight):
+            return ops.ggml_mul_mat_ptq1_0_mma(
+                weight, x.contiguous(), weight.shape[0], _PTQ1_0_MMA_VARIANT, True
+            )
         if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
             return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
         return _dequant_matmul(x, weight, weight_type)
@@ -197,6 +234,10 @@ def _fused_mul_mat_gguf(
             return ops.ggml_mul_mat_vec_ptq1_0(weight, x, weight.shape[0])
         if x.shape[0] <= _PRISM_MMVQ_MAX_ROWS:
             return ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
+        if _ptq1_0_mma_fits(x, weight):
+            return ops.ggml_mul_mat_ptq1_0_mma(
+                weight, x.contiguous(), weight.shape[0], _PTQ1_0_MMA_VARIANT, False
+            )
         if x.shape[0] <= _PRISM_TRITON_GEMM_MAX_ROWS:
             return ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
         return _dequant_matmul(x, weight, weight_type)

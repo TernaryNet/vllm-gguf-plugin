@@ -20,6 +20,8 @@ Tensor ggml_dequantize_ptq1_0_planar(Tensor W, int64_t m, int64_t n,
 Tensor ggml_mul_mat_vec_ptq1_0_rot(Tensor W, Tensor X, Tensor signs,
                                    int64_t row, bool planar);
 Tensor small_m_gemv(Tensor W, Tensor X);
+Tensor ggml_mul_mat_ptq1_0_mma(Tensor W, Tensor X, int64_t row, int64_t variant,
+                               bool planar);
 Tensor ggml_moe_a8(Tensor X, Tensor W, Tensor sorted_token_ids,
                    Tensor expert_ids, Tensor num_tokens_post_padded,
                    int64_t type, int64_t row, int64_t top_k, int64_t tokens);
@@ -47,6 +49,8 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
       "ggml_mul_mat_vec_ptq1_0_rot(Tensor W, Tensor X, Tensor signs, "
       "SymInt row, bool planar) -> Tensor");
   ops.def("small_m_gemv(Tensor W, Tensor X) -> Tensor");
+      "ggml_mul_mat_ptq1_0_mma(Tensor W, Tensor X, SymInt row, int variant, "
+      "bool planar) -> Tensor");
   ops.def(
       "ggml_moe_a8(Tensor X, Tensor W, "
       "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
@@ -71,6 +75,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_mul_mat_vec_ptq1_0_rot",
            TORCH_BOX(&ggml_mul_mat_vec_ptq1_0_rot));
   ops.impl("small_m_gemv", TORCH_BOX(&small_m_gemv));
+  ops.impl("ggml_mul_mat_ptq1_0_mma", TORCH_BOX(&ggml_mul_mat_ptq1_0_mma));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
 }

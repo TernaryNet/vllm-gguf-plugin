@@ -5,6 +5,7 @@
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/util/Exception.h>
 
 #include "../cuda_compat.h"
 #include "../dispatch_utils.h"
@@ -14,6 +15,7 @@
 #include "dequantize.cuh"
 #include "mmvq.cuh"
 #include "ptq1_0_pt.cuh"
+#include "ptq1_0_mma.cuh"
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
@@ -93,7 +95,9 @@ Tensor ggml_dequantize(Tensor W,  // quant weight
   STD_TORCH_CHECK(type != 1143,
                   "planar PTQ1_0 (1143) goes through ggml_dequantize_ptq1_0_planar");
   const auto dtype_ = dtype.value_or(ScalarType::Half);
-  Tensor DW = torch::stable::new_zeros(W, {m, n}, dtype_);
+  // every dequantize kernel writes all m * n outputs; no zero fill (it cost a full extra
+  // write of the dense copy -- 140 ms a 2048-row prefill step on an L4)
+  Tensor DW = torch::stable::new_empty(W, {m, n}, dtype_);
   cudaStream_t stream = get_current_cuda_stream(device_idx);
 
   VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
@@ -251,6 +255,54 @@ Tensor ggml_mul_mat_vec_ptq1_0(Tensor W,  // quant weight
     mul_mat_vec_ptq1_0_pt_cuda<scalar_t>(
         (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
         col, row, vecs, stream);
+  });
+  return Y;
+}
+
+static inline int device_idx_for_sms(const Tensor& X) {
+  return X.get_device_index();
+}
+
+// PTQ1_0 GEMM on int8 tensor cores for prefill-sized batches (see ptq1_0_mma.cuh): X is
+// quantized to Q8 per 32 elements exactly like the Triton tier, so Y is bit-identical to it.
+// variant selects the tile configuration (bench); -1 = default.
+Tensor ggml_mul_mat_ptq1_0_mma(Tensor W,  // quant weight
+                               Tensor X,  // input, contiguous [M, K]
+                               int64_t row, int64_t variant, bool planar) {
+  const int64_t col = X.sizes()[1];
+  const int64_t vecs = X.sizes()[0];
+  STD_TORCH_CHECK(col % 512 == 0, "ggml_mul_mat_ptq1_0_mma: K must be a multiple of 512");
+  STD_TORCH_CHECK(W.sizes()[1] == col / QK_PTQ1_0 * (int64_t)sizeof(block_ptq1_0),
+                  "ggml_mul_mat_ptq1_0_mma: weight row size does not match K");
+  STD_TORCH_CHECK(W.sizes()[0] >= row, "ggml_mul_mat_ptq1_0_mma: weight has fewer rows than row");
+  static int sm_count = 0;
+  if (sm_count == 0) {
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_idx_for_sms(X));
+  }
+  const int v = variant < 0 ? ptq1_0_mma::choose_variant((int)vecs, (int)row, sm_count)
+                            : (int)variant;
+  STD_TORCH_CHECK((v & 255) < PTQ1_0_MMA_NUM_VARIANTS, "ggml_mul_mat_ptq1_0_mma: unknown variant");
+  const int group = ptq1_0_mma::variant_group(v);
+  STD_TORCH_CHECK(row % ptq1_0_mma::variant_bn(v & 255) == 0,
+                  "ggml_mul_mat_ptq1_0_mma: row must be a multiple of the N tile");
+  STD_TORCH_CHECK(X.is_contiguous(), "ggml_mul_mat_ptq1_0_mma: X must be contiguous");
+  const int32_t device_idx = X.get_device_index();
+  const DeviceGuard device_guard(device_idx);
+  cudaStream_t stream = get_current_cuda_stream(device_idx);
+  Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
+  if (vecs == 0) {
+    return Y;
+  }
+  Tensor quant_X = torch::stable::new_empty(W, {vecs, col}, ScalarType::Char);
+  Tensor scale_X = torch::stable::new_empty(W, {vecs, col / group}, ScalarType::Half);
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_ptq1_0_mma", [&] {
+    ptq1_0_mma::quantize_q8_cuda<scalar_t>(
+        (const scalar_t*)X.data_ptr(), (int8_t*)quant_X.data_ptr(),
+        (half*)scale_X.data_ptr(), (int)vecs, (int)col, group, stream);
+    ptq1_0_mma::ptq1_0_mma_gemm_cuda<scalar_t>(
+        (const int8_t*)quant_X.data_ptr(), (const half*)scale_X.data_ptr(),
+        W.data_ptr(), (scalar_t*)Y.data_ptr(), (int)vecs, (int)row, (int)col, v,
+        planar, stream);
   });
   return Y;
 }
