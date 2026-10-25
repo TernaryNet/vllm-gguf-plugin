@@ -153,7 +153,7 @@ def test_ptq1_0_mma_matches_triton_tier(num_tokens: int, hidden_size: int, dtype
         pytest.skip("CUDA extension without ggml_mul_mat_ptq1_0_mma")
     seed_everything(0)
     packed, dense = _packed(_ternary_weight(256, hidden_size))
-    x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    x = torch.rand((num_tokens, hidden_size), dtype=dtype, device="cuda")
     tri = ggml_mul_mat_a8_triton(packed, x, QUANT_TYPE, 256)
     from vllm_gguf_plugin.quantization.linear import repack_ptq1_0_planar
 
