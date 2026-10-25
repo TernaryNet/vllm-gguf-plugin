@@ -50,6 +50,38 @@ HADAMARD_COMPUTE_DTYPE = torch.float32
 _LAYOUT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
+def _hadacore_op():
+    """vLLM's Hadacore FWHT kernel (x @ H / sqrt(n), Sylvester order), if built.
+
+    Scratch-branch experiment: replaces the dense ``x @ H`` GEMM per folded
+    linear (8-36 us on an L40S) with a ~1-2 us tensor-core FWHT. Disabled with
+    VLLM_GGUF_HADACORE=0.
+    """
+    import os
+
+    if os.environ.get("VLLM_GGUF_HADACORE", "1") != "1":
+        return None
+    try:
+        from vllm import _custom_ops
+    except ImportError:
+        return None
+    if not hasattr(torch.ops, "_C") or not hasattr(torch.ops._C, "hadacore_transform"):
+        return None
+    return _custom_ops.hadacore_transform
+
+
+_HADACORE = None
+_HADACORE_RESOLVED = False
+
+
+def _get_hadacore():
+    global _HADACORE, _HADACORE_RESOLVED
+    if not _HADACORE_RESOLVED:
+        _HADACORE = _hadacore_op()
+        _HADACORE_RESOLVED = True
+    return _HADACORE
+
+
 @dataclass(frozen=True, eq=False)
 class PrismHadamardSpec:
     """Validated ``prism.hadamard.*`` metadata of one GGUF model."""
@@ -384,7 +416,11 @@ class GGUFHadamardLayout:
         out = x.to(dtype)
         if not inverse and signs is not None:
             out = out * signs
-        out = (out.reshape(-1, self.block_size) @ matrix).reshape(x.shape)
+        hadacore = _get_hadacore() if out.is_cuda and dtype in (torch.float16, torch.bfloat16) else None
+        if hadacore is not None and self.block_size <= (1 << 15):
+            out = hadacore(out.reshape(-1, self.block_size).contiguous(), False).reshape(x.shape)
+        else:
+            out = (out.reshape(-1, self.block_size) @ matrix).reshape(x.shape)
         if inverse and signs is not None:
             out = out * signs
         return out.to(x.dtype)
