@@ -49,6 +49,7 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
       "ggml_mul_mat_vec_ptq1_0_rot(Tensor W, Tensor X, Tensor signs, "
       "SymInt row, bool planar) -> Tensor");
   ops.def("small_m_gemv(Tensor W, Tensor X) -> Tensor");
+  ops.def(
       "ggml_mul_mat_ptq1_0_mma(Tensor W, Tensor X, SymInt row, int variant, "
       "bool planar) -> Tensor");
   ops.def(
