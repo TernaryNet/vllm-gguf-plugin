@@ -61,8 +61,18 @@ _PRISM_DEQUANT_ROW_CHUNK = 16384
 _SMALL_M_GEMV = os.environ.get("VLLM_GGUF_SMALL_M_GEMV", "1") == "1"
 _SMALL_M_GEMV_MAX_OUT = 1024
 # L40S, [96, 5120]: 2.8-3.7 us at 2-4 rows vs cuBLAS 27.5; at 8 rows cuBLAS picks
-# a good kernel (5.1 vs 5.8 us), 5-7 rows unmeasured
+# a good kernel (5.1 vs 5.8 us), 5-7 rows unmeasured. At TP 4 the per-rank
+# weight is [24, 5120] and cuBLAS keeps the slow tile at 8 rows too (4x L4,
+# 46 us a call, 2.4 ms of the MTP 4-stream step), so weights of at most
+# _SMALL_M_GEMV_NARROW_OUT rows use the kernel up to 8 rows
+# (VLLM_GGUF_SMALL_M_NARROW_8=0 keeps them at 4).
 _SMALL_M_GEMV_MAX_ROWS = 4
+_SMALL_M_GEMV_NARROW_OUT = 64
+_SMALL_M_GEMV_NARROW_ROWS = 8 if os.environ.get("VLLM_GGUF_SMALL_M_NARROW_8", "1") == "1" else 4
+
+
+def _small_m_max_rows(weight: torch.Tensor) -> int:
+    return _SMALL_M_GEMV_NARROW_ROWS if weight.shape[0] <= _SMALL_M_GEMV_NARROW_OUT else _SMALL_M_GEMV_MAX_ROWS
 
 def _small_m_gemv_fits(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Static (trace-time) conditions for the small-M kernel; rows are checked at run time."""
@@ -213,7 +223,7 @@ def _fused_mul_mat_gguf(
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type in UNQUANTIZED_TYPES:
-        if _small_m_gemv_fits(x, weight) and 2 <= x.shape[0] <= _SMALL_M_GEMV_MAX_ROWS:
+        if _small_m_gemv_fits(x, weight) and 2 <= x.shape[0] <= _small_m_max_rows(weight):
             return ops.small_m_gemv(weight, x.contiguous())
         return x @ weight.T
     if weight_type == PTQ1_0_PLANAR:
@@ -325,7 +335,7 @@ direct_register_custom_op(
 
 
 def _gguf_small_m_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    if 2 <= x.shape[0] <= _SMALL_M_GEMV_MAX_ROWS:
+    if 2 <= x.shape[0] <= _small_m_max_rows(weight):
         return ops.small_m_gemv(weight, x.contiguous())
     return torch.nn.functional.linear(x, weight)
 
